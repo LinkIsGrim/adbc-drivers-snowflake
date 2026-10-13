@@ -22,27 +22,41 @@
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
     SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
 
-## underscore names MY_DB/MY_SCH/MY_TBL: 8 statement(s), 6 IN ACCOUNT
+## underscore names MY_DB/MY_SCH/MY_TBL: 8 statement(s), 1 IN ACCOUNT
     <queries/get_objects_all.sql>
         CATALOG="MY_DB" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MY_DB"."MY_SCH"."MY_TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'MY_TBL' IN SCHEMA "MY_DB"."MY_SCH"
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN DATABASE "MY_DB"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
+
+## underscore catalog only MY_DB: 8 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql>
+        CATALOG="MY_DB" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "MY_DB"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ OBJECTS IN DATABASE "MY_DB"
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "MY_DB"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
+
+## underscore names matching two databases MULTI_DB/MY_SCH/MY_TBL: 8 statement(s), 6 IN ACCOUNT
+    <queries/get_objects_all.sql>
+        CATALOG="MULTI_DB" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MULTI_DB"."MY_SCH"."MY_TBL"
     SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
     SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MULTI_DB' IN ACCOUNT
     SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'MY_TBL' IN ACCOUNT
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN ACCOUNT
     SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
 
-## underscore catalog only MY_DB: 8 statement(s), 6 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="MY_DB" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
-    SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "MY_DB"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN ACCOUNT
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
+## underscore names matching no database NO_DB/MY_SCH/MY_TBL: 1 statement(s), 1 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'NO_DB' IN ACCOUNT
 
 ## percent patterns DB%/SCH%/TBL%: 8 statement(s), 7 IN ACCOUNT
     <queries/get_objects_all.sql>
