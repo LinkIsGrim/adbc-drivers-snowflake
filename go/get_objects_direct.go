@@ -44,16 +44,15 @@ import (
 func (c *connectionImpl) getObjectsDirectPath(
 	ctx context.Context,
 	depth adbc.ObjectDepth,
-	catalog, dbSchema, tableName *string,
+	scope *getObjectsScope,
+	dbSchema, tableName *string,
 	tableType []string,
 	hasViews, hasTables bool,
 ) (array.RecordReader, error) {
-	specificCatalog := catalog != nil && (c.matchExactly || !isWildcardStr(*catalog))
-
 	switch depth {
 	case adbc.ObjectDepthDBSchemas:
-		if specificCatalog {
-			return c.getObjectsDBSchemasDirect(ctx, *catalog, dbSchema)
+		if scope.catalog != nil {
+			return c.getObjectsDBSchemasDirect(ctx, *scope.catalog, dbSchema)
 		}
 	case adbc.ObjectDepthTables:
 		if len(tableType) > 0 && !hasViews && !hasTables {
@@ -61,9 +60,11 @@ func (c *connectionImpl) getObjectsDirectPath(
 			// return an empty result without any round-trips.
 			return buildGetObjectsResult(c.Alloc)
 		}
-		if specificCatalog {
-			specificSchema := dbSchema != nil && (c.matchExactly || !isWildcardStr(*dbSchema)) && (!c.matchExactly || *dbSchema != "")
-			return c.getObjectsTablesDirect(ctx, *catalog, dbSchema, tableName, tableType, specificSchema)
+		if scope.catalog != nil {
+			if scope.dbSchema != nil {
+				return c.getObjectsTablesDirect(ctx, *scope.catalog, scope.dbSchema, tableName, tableType, true)
+			}
+			return c.getObjectsTablesDirect(ctx, *scope.catalog, dbSchema, tableName, tableType, false)
 		}
 	}
 

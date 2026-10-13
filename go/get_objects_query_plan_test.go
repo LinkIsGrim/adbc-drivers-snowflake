@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -93,6 +94,8 @@ func TestGetObjectsQueryPlan(t *testing.T) {
 		{name: "plain names DB/SCH/TBL", catalog: sp("DB"), dbSchema: sp("SCH"), tableName: sp("TBL")},
 		{name: "underscore names MY_DB/MY_SCH/MY_TBL", catalog: sp("MY_DB"), dbSchema: sp("MY_SCH"), tableName: sp("MY_TBL")},
 		{name: "underscore catalog only MY_DB", catalog: sp("MY_DB")},
+		{name: "underscore names matching two databases MULTI_DB/MY_SCH/MY_TBL", catalog: sp("MULTI_DB"), dbSchema: sp("MY_SCH"), tableName: sp("MY_TBL")},
+		{name: "underscore names matching no database NO_DB/MY_SCH/MY_TBL", catalog: sp("NO_DB"), dbSchema: sp("MY_SCH"), tableName: sp("MY_TBL")},
 		{name: "percent patterns DB%/SCH%/TBL%", catalog: sp("DB%"), dbSchema: sp("SCH%"), tableName: sp("TBL%")},
 		{name: "plain names with column filter COL", catalog: sp("DB"), dbSchema: sp("SCH"), tableName: sp("TBL"), columnName: sp("COL")},
 		{name: "plain names with table type VIEW", catalog: sp("DB"), dbSchema: sp("SCH"), tableName: sp("TBL"), tableType: []string{"VIEW"}},
@@ -118,6 +121,7 @@ func TestGetObjectsQueryPlan(t *testing.T) {
 			for _, in := range inputs {
 				cnxn, fc := newFakeConnection(t)
 				cnxn.matchExactly = in.matchExactly
+				fc.Respond = fakeAccountShowTerse
 				rdr, err := cnxn.GetObjects(context.Background(), d.depth, in.catalog, in.dbSchema, in.tableName, in.columnName, in.tableType)
 				require.NoError(t, err, in.name)
 				for rdr.Next() {
@@ -147,6 +151,33 @@ func TestGetObjectsQueryPlan(t *testing.T) {
 			assert.Equal(t, string(want), out.String(), "GetObjects query plan changed; if intended, rerun with -update and review the diff")
 		})
 	}
+}
+
+var reShowTerseLike = regexp.MustCompile(`^SHOW TERSE /\* ADBC:getObjects \*/ (DATABASES|SCHEMAS) LIKE '([^']*)'`)
+
+// fakeAccountShowTerse answers SHOW TERSE DATABASES/SCHEMAS LIKE queries the
+// way an account would: a pattern starting with MULTI matches two objects, one
+// starting with NO_ matches none, and any other pattern matches one object
+// named like the pattern. Everything else gets the default empty result.
+func fakeAccountShowTerse(query string) (driver.Rows, error) {
+	m := reShowTerseLike.FindStringSubmatch(query)
+	if m == nil {
+		return nil, nil
+	}
+	pattern := m[2]
+	rows := &fakeRows{Cols: []string{"created_on", "name", "kind", "database_name", "schema_name"}}
+	var names []string
+	switch {
+	case strings.HasPrefix(pattern, "MULTI"):
+		names = []string{strings.Replace(pattern, "_", "-", 1), strings.Replace(pattern, "_", "X", 1)}
+	case strings.HasPrefix(pattern, "NO_"):
+	default:
+		names = []string{pattern}
+	}
+	for _, n := range names {
+		rows.Values = append(rows.Values, []driver.Value{"2026-01-01", n, "", "DB", ""})
+	}
+	return rows, nil
 }
 
 func countInAccount(plan []recordedStatement) int {
