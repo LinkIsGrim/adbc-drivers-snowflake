@@ -25,10 +25,12 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"golang.org/x/sync/errgroup"
 )
 
 //go:embed queries/get_statistics_tables.sql
@@ -63,6 +65,10 @@ const (
 	// When approximate=false and the candidate count exceeds this limit, we return StatusNotImplemented
 	// to avoid performance cliffs on large Snowflake accounts.
 	maxExactTables = 1000
+
+	// getStatisticsConcurrency bounds how many metadata queries GetStatistics
+	// runs at once.
+	getStatisticsConcurrency = 8
 )
 
 func (c *connectionImpl) GetStatisticNames(ctx context.Context) (array.RecordReader, error) {
@@ -167,45 +173,25 @@ func (c *connectionImpl) GetStatistics(
 		return driverbase.EmptyGetStatisticsReader()
 	}
 
-	// Query tables from each matching database and group by catalog
-	// In exact mode, track total count and fail fast if limit exceeded
-	tablesByCatalog := make(map[string][]tableInfo)
-	catalogOrder := []string{}
-	totalTables := 0
-
-	for _, db := range databasesToQuery {
-		quotedDB := quoteIdentifier(db)
-		query := fmt.Sprintf(queryGetStatisticsTables, quotedDB)
-
-		nvargs := []driver.NamedValue{
-			{Ordinal: 1, Value: schemaFilter},
-			{Ordinal: 2, Value: tableFilter},
-		}
-
-		rows, err := c.cn.QueryContext(ctx, query, nvargs)
-		if err != nil {
-			return nil, errToAdbcErr(adbc.StatusIO, fmt.Errorf("failed to query database %s: %w", db, err))
-		}
-
-		tables, err := readTableRows(rows)
-		err = errors.Join(err, rows.Close())
-
-		if err != nil {
-			return nil, errToAdbcErr(adbc.StatusIO, fmt.Errorf("failed to read table rows from database %s: %w", db, err))
-		}
-
-		if len(tables) > 0 {
-			actualCatalog := tables[0].catalog
-			if _, exists := tablesByCatalog[actualCatalog]; !exists {
-				catalogOrder = append(catalogOrder, actualCatalog)
+	// Query tables from each matching database concurrently, then group by
+	// catalog in database order. In exact mode, track the total count and fail
+	// fast once the limit is exceeded.
+	tablesPerDatabase := make([][]tableInfo, len(databasesToQuery))
+	var totalTables atomic.Int64
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(getStatisticsConcurrency)
+	for i, db := range databasesToQuery {
+		g.Go(func() error {
+			tables, err := queryStatisticsTables(gCtx, c.cn, db, schemaFilter, tableFilter)
+			if err != nil {
+				return err
 			}
-			tablesByCatalog[actualCatalog] = append(tablesByCatalog[actualCatalog], tables...)
-			totalTables += len(tables)
+			tablesPerDatabase[i] = tables
 
 			// Early bailout in exact mode: fail fast once we exceed the limit
 			// Approximate mode has no limit - it's designed to handle arbitrarily large result sets
-			if !approximate && totalTables > maxExactTables {
-				return nil, adbc.Error{
+			if !approximate && totalTables.Add(int64(len(tables))) > maxExactTables {
+				return adbc.Error{
 					Code: adbc.StatusNotImplemented,
 					Msg: fmt.Sprintf(
 						"exact statistics requested for more than %d tables; use approximate=true or narrower catalog/schema/table filters",
@@ -213,6 +199,22 @@ func (c *connectionImpl) GetStatistics(
 					),
 				}
 			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	tablesByCatalog := make(map[string][]tableInfo)
+	catalogOrder := []string{}
+	for _, tables := range tablesPerDatabase {
+		if len(tables) > 0 {
+			actualCatalog := tables[0].catalog
+			if _, exists := tablesByCatalog[actualCatalog]; !exists {
+				catalogOrder = append(catalogOrder, actualCatalog)
+			}
+			tablesByCatalog[actualCatalog] = append(tablesByCatalog[actualCatalog], tables...)
 		}
 	}
 
@@ -220,67 +222,86 @@ func (c *connectionImpl) GetStatistics(
 		return driverbase.EmptyGetStatisticsReader()
 	}
 
+	// In exact mode, query storage metrics for each catalog and clustering
+	// depth for each clustered table, concurrently. Both are optional: a
+	// failed query just leaves those statistics out.
+	storageMetricsByCatalog := make([]map[string]map[string]storageMetric, len(catalogOrder))
+	clusteringDepths := make([][]*float64, len(catalogOrder))
+	if !approximate {
+		var g errgroup.Group
+		g.SetLimit(getStatisticsConcurrency)
+		for ci, catalogName := range catalogOrder {
+			tables := tablesByCatalog[catalogName]
+			g.Go(func() error {
+				// Storage metrics require ACCOUNTADMIN
+				if sm, err := queryStorageMetrics(ctx, c.cn, catalogName, tables); err == nil {
+					storageMetricsByCatalog[ci] = sm
+				}
+				return nil
+			})
+
+			clusteringDepths[ci] = make([]*float64, len(tables))
+			for ti, t := range tables {
+				if !t.clusteringKey.Valid || t.clusteringKey.String == "" {
+					continue
+				}
+				g.Go(func() error {
+					if depth, err := getClusteringDepth(ctx, c.cn, t.catalog, t.schema, t.table); err == nil {
+						clusteringDepths[ci][ti] = &depth
+					}
+					return nil
+				})
+			}
+		}
+		_ = g.Wait()
+	}
+
 	// Build statistics for each catalog
 	schemaOrderByCatalog := make(map[string][]string)
 	statsByCatalog := make(map[string]map[string][]driverbase.Statistic)
 
-	for _, catalogName := range catalogOrder {
+	for ci, catalogName := range catalogOrder {
 		tables := tablesByCatalog[catalogName]
-
-		// Query storage metrics for this specific catalog (expensive, skip if approximate=true)
-		var storageMetrics map[string]map[string]storageMetric
-		if !approximate {
-			var err error
-			storageMetrics, err = queryStorageMetrics(ctx, c.cn, catalogName, tables)
-			if err != nil {
-				// Storage metrics are optional (requires ACCOUNTADMIN)
-				storageMetrics = make(map[string]map[string]storageMetric)
-			}
-		} else {
-			storageMetrics = make(map[string]map[string]storageMetric)
-		}
+		storageMetrics := storageMetricsByCatalog[ci]
 
 		// Build statistics grouped by schema
 		statsBySchema := make(map[string][]driverbase.Statistic)
 		schemaOrder := []string{}
 		seenSchemas := make(map[string]bool)
 
-		for _, ti := range tables {
+		for ti, t := range tables {
 			// Track schema order
-			if !seenSchemas[ti.schema] {
-				schemaOrder = append(schemaOrder, ti.schema)
-				seenSchemas[ti.schema] = true
+			if !seenSchemas[t.schema] {
+				schemaOrder = append(schemaOrder, t.schema)
+				seenSchemas[t.schema] = true
 			}
 
 			// Build base statistics (always included, always approximate since from cached INFORMATION_SCHEMA)
 			stats := []driverbase.Statistic{
-				driverbase.NewFloat64Stat(ti.table, nil, adbc.StatisticRowCountKey, float64(ti.rowCount), true),
-				driverbase.NewInt64Stat(ti.table, nil, SnowflakeStatisticBytesKey, ti.bytes, true),
-				driverbase.NewInt64Stat(ti.table, nil, SnowflakeStatisticRetentionTimeDaysKey, ti.retentionTime, true),
+				driverbase.NewFloat64Stat(t.table, nil, adbc.StatisticRowCountKey, float64(t.rowCount), true),
+				driverbase.NewInt64Stat(t.table, nil, SnowflakeStatisticBytesKey, t.bytes, true),
+				driverbase.NewInt64Stat(t.table, nil, SnowflakeStatisticRetentionTimeDaysKey, t.retentionTime, true),
 			}
 
 			// Add storage breakdown if available and not in approximate mode
 			if !approximate {
-				if schemaMetrics, ok := storageMetrics[ti.schema]; ok {
-					if sm, ok := schemaMetrics[ti.table]; ok {
+				if schemaMetrics, ok := storageMetrics[t.schema]; ok {
+					if sm, ok := schemaMetrics[t.table]; ok {
 						stats = append(stats,
-							driverbase.NewInt64Stat(ti.table, nil, SnowflakeStatisticActiveBytesKey, sm.activeBytes, false),
-							driverbase.NewInt64Stat(ti.table, nil, SnowflakeStatisticTimeTravelBytesKey, sm.timeTravelBytes, false),
-							driverbase.NewInt64Stat(ti.table, nil, SnowflakeStatisticFailsafeBytesKey, sm.failsafeBytes, false),
+							driverbase.NewInt64Stat(t.table, nil, SnowflakeStatisticActiveBytesKey, sm.activeBytes, false),
+							driverbase.NewInt64Stat(t.table, nil, SnowflakeStatisticTimeTravelBytesKey, sm.timeTravelBytes, false),
+							driverbase.NewInt64Stat(t.table, nil, SnowflakeStatisticFailsafeBytesKey, sm.failsafeBytes, false),
 						)
 					}
 				}
-			}
 
-			// Add clustering depth if clustering key exists (expensive, skip if approximate=true)
-			if !approximate && ti.clusteringKey.Valid && ti.clusteringKey.String != "" {
-				clusteringDepth, err := getClusteringDepth(ctx, c.cn, ti.catalog, ti.schema, ti.table)
-				if err == nil {
-					stats = append(stats, driverbase.NewFloat64Stat(ti.table, nil, SnowflakeStatisticClusteringDepthKey, clusteringDepth, false))
+				// Add clustering depth if the table has a clustering key and the query succeeded
+				if depth := clusteringDepths[ci][ti]; depth != nil {
+					stats = append(stats, driverbase.NewFloat64Stat(t.table, nil, SnowflakeStatisticClusteringDepthKey, *depth, false))
 				}
 			}
 
-			statsBySchema[ti.schema] = append(statsBySchema[ti.schema], stats...)
+			statsBySchema[t.schema] = append(statsBySchema[t.schema], stats...)
 		}
 
 		schemaOrderByCatalog[catalogName] = schemaOrder
@@ -289,6 +310,28 @@ func (c *connectionImpl) GetStatistics(
 
 	// Build Arrow structure from pre-computed statistics
 	return driverbase.BuildGetStatisticsReader(c.Alloc, catalogOrder, schemaOrderByCatalog, statsByCatalog)
+}
+
+// queryStatisticsTables reads the base table statistics for one database
+// from its INFORMATION_SCHEMA.TABLES.
+func queryStatisticsTables(ctx context.Context, conn driver.QueryerContext, db, schemaFilter, tableFilter string) ([]tableInfo, error) {
+	query := fmt.Sprintf(queryGetStatisticsTables, quoteIdentifier(db))
+	nvargs := []driver.NamedValue{
+		{Ordinal: 1, Value: schemaFilter},
+		{Ordinal: 2, Value: tableFilter},
+	}
+
+	rows, err := conn.QueryContext(ctx, query, nvargs)
+	if err != nil {
+		return nil, errToAdbcErr(adbc.StatusIO, fmt.Errorf("failed to query database %s: %w", db, err))
+	}
+
+	tables, err := readTableRows(rows)
+	err = errors.Join(err, rows.Close())
+	if err != nil {
+		return nil, errToAdbcErr(adbc.StatusIO, fmt.Errorf("failed to read table rows from database %s: %w", db, err))
+	}
+	return tables, nil
 }
 
 // tableInfo holds basic table information from INFORMATION_SCHEMA.TABLES
