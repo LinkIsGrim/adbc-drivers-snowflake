@@ -2822,6 +2822,36 @@ func (suite *SnowflakeTests) TestChangeDatabaseAndGetObjects() {
 	suite.NoError(err2)
 }
 
+func (suite *SnowflakeTests) TestCurrentNamespaceCanceledContext() {
+	cnxnopt, ok := suite.cnxn.(adbc.GetSetOptionsWithContext)
+	suite.Require().True(ok)
+
+	ctx, cancel := context.WithCancel(suite.ctx)
+	cancel()
+
+	_, err := cnxnopt.GetOption(ctx, adbc.OptionKeyCurrentCatalog)
+	suite.Error(err)
+	_, err = cnxnopt.GetOption(ctx, adbc.OptionKeyCurrentDbSchema)
+	suite.Error(err)
+}
+
+// Commit and Rollback finish the transaction even if the caller's context is
+// canceled.
+func (suite *SnowflakeTests) TestCommitRollbackCanceledContext() {
+	cnxnopt, ok := suite.cnxn.(adbc.GetSetOptionsWithContext)
+	suite.Require().True(ok)
+	suite.Require().NoError(cnxnopt.SetOption(suite.ctx, adbc.OptionKeyAutoCommit, adbc.OptionValueDisabled))
+	defer func() {
+		suite.NoError(cnxnopt.SetOption(suite.ctx, adbc.OptionKeyAutoCommit, adbc.OptionValueEnabled))
+	}()
+
+	ctx, cancel := context.WithCancel(suite.ctx)
+	cancel()
+
+	suite.NoError(suite.cnxn.Commit(ctx))
+	suite.NoError(suite.cnxn.Rollback(ctx))
+}
+
 func (suite *SnowflakeTests) TestGetSetClientConfigFile() {
 	file := "fileNameJustForTest.json"
 	options := map[string]string{
