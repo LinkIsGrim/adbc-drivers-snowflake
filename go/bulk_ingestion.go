@@ -38,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -57,7 +58,6 @@ const (
 	vectorizedScannerOption  = "USE_VECTORIZED_SCANNER=TRUE"
 	putQueryTmpl             = "PUT 'file:///tmp/placeholder/%s' @" + bindStageName + " OVERWRITE = TRUE"
 	copyQuery                = "COPY INTO IDENTIFIER(?) FROM @" + bindStageName + " MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE"
-	countQuery               = "SELECT COUNT(*) FROM IDENTIFIER(?)"
 	megabyte                 = 1024 * 1024
 )
 
@@ -162,17 +162,7 @@ func (st *statement) ingestRecord(ctx context.Context, copyQ string) (nrows int6
 		st.bound = nil
 	}()
 
-	var (
-		initialRows int64
-		target      = st.qualifiedTableName()
-	)
-
-	// Check final row count of target table to get definitive rows affected
-	initialRows, err = countRowsInTable(ctx, st.cnxn.cn, target)
-	if err != nil {
-		st.bound.Release()
-		return
-	}
+	target := st.qualifiedTableName()
 
 	parquetProps, arrowProps := newWriterProps(st.alloc, &st.ingestOptions)
 	g := errgroup.Group{}
@@ -223,16 +213,11 @@ func (st *statement) ingestRecord(ctx context.Context, copyQ string) (nrows int6
 		return
 	}
 
-	// Load the uploaded file into the target table
-	_, err = st.cnxn.cn.ExecContext(ctx, copyQ, []driver.NamedValue{{Value: target}})
-	if err != nil {
-		return
-	}
-
-	// Check final row count of target table to get definitive rows affected
-	nrows, err = countRowsInTable(ctx, st.cnxn.cn, target)
-	nrows = nrows - initialRows
-	return
+	// Load the uploaded file into the target table. Rows affected is the
+	// server's count of rows loaded.
+	var filesToCopy fileSet
+	filesToCopy.Add(fileName)
+	return executeCopyQuery(ctx, st.cnxn.cn, copyQ, target, &filesToCopy)
 }
 
 // ingestStream performs bulk ingestion of a RecordReader and returns the
@@ -246,26 +231,16 @@ func (st *statement) ingestStream(ctx context.Context, copyQ string) (nrows int6
 		st.streamBind = nil
 	}()
 
-	var (
-		initialRows int64
-		target      = st.qualifiedTableName()
-	)
+	target := st.qualifiedTableName()
 
-	// Check final row count of target table to get definitive rows affected
-	initialRows, err = countRowsInTable(ctx, st.cnxn.cn, target)
-	if err != nil {
-		return
-	}
-
+	// Rows affected is the server's count of rows loaded by each COPY that
+	// completed, reported even in the case of an error, since we may have
+	// ingested part of the data.
+	var rowsLoaded atomic.Int64
 	defer func() {
-		// Always check the resulting row count, even in the case of an error. We may have ingested part of the data.
-		ctx := context.WithoutCancel(ctx)
-		n, countErr := countRowsInTable(ctx, st.cnxn.cn, target)
-		nrows = n - initialRows
+		nrows = rowsLoaded.Load()
 
-		// Ingestion, row-count check, or both could have failed
 		// Wrap any failures as ADBC errors
-		err = errors.Join(err, countErr)
 		if errors.Is(err, context.Canceled) {
 			err = errToAdbcErr(adbc.StatusCancelled, err)
 		} else {
@@ -313,7 +288,7 @@ func (st *statement) ingestStream(ctx context.Context, copyQ string) (nrows int6
 	}
 
 	// Kickoff background tasks to COPY Parquet files into Snowflake table as they are uploaded
-	fileReady, finishCopy, cancelCopy := runCopyTasks(ctx, st.cnxn.cn, copyQ, target, int(st.ingestOptions.copyConcurrency))
+	fileReady, finishCopy, cancelCopy := runCopyTasks(ctx, st.cnxn.cn, copyQ, target, int(st.ingestOptions.copyConcurrency), &rowsLoaded)
 
 	// Read Parquet files from buffer pool and upload to Snowflake stage in parallel
 	g.Go(func() error {
@@ -560,10 +535,12 @@ func uploadAllStreams(
 	return g.Wait()
 }
 
-func executeCopyQuery(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, filesToCopy *fileSet) (err error) {
+// executeCopyQuery runs one COPY, removes the files it loaded from
+// filesToCopy, and returns the number of rows Snowflake reports loading.
+func executeCopyQuery(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, filesToCopy *fileSet) (rowsLoaded int64, err error) {
 	rows, err := cn.QueryContext(ctx, copyQ, []driver.NamedValue{{Value: tableName}})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		err = errors.Join(err, rows.Close())
@@ -572,7 +549,11 @@ func executeCopyQuery(ctx context.Context, cn snowflakeConn, copyQ string, table
 	fileColIdx := slices.Index(rows.Columns(), "file")
 	if fileColIdx < 0 {
 		// COPY response does not include 'file' column if no files we copied
-		return nil
+		return 0, nil
+	}
+	rowsLoadedColIdx := slices.Index(rows.Columns(), "rows_loaded")
+	if rowsLoadedColIdx < 0 {
+		return 0, fmt.Errorf("unexpected response for COPY, no 'rows_loaded' column in %v", rows.Columns())
 	}
 
 	vals := make([]driver.Value, len(rows.Columns()))
@@ -582,19 +563,42 @@ func executeCopyQuery(ctx context.Context, cn snowflakeConn, copyQ string, table
 			break
 		}
 		if err != nil {
-			return err
+			return rowsLoaded, err
 		}
 		file, ok := vals[fileColIdx].(string)
 		if !ok {
-			return fmt.Errorf("unexpected response for COPY, expected 'file' to be string, found: %T", vals[fileColIdx])
+			return rowsLoaded, fmt.Errorf("unexpected response for COPY, expected 'file' to be string, found: %T", vals[fileColIdx])
 		}
+		n, err := copyResultCount(vals[rowsLoadedColIdx])
+		if err != nil {
+			return rowsLoaded, fmt.Errorf("unexpected response for COPY, 'rows_loaded' for %s: %w", file, err)
+		}
+		rowsLoaded += n
 		filesToCopy.Remove(file)
 	}
 
-	return nil
+	return rowsLoaded, nil
 }
 
-func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, concurrency int) (func(string), func() error, func()) {
+// copyResultCount parses a count column of a COPY result, which gosnowflake
+// returns as a string for JSON results.
+func copyResultCount(v driver.Value) (int64, error) {
+	switch v := v.(type) {
+	case nil:
+		return 0, nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	case int64:
+		return v, nil
+	default:
+		return 0, fmt.Errorf("expected a count, found: %T", v)
+	}
+}
+
+// runCopyTasks starts loading uploaded files into tableName in the
+// background. The rows loaded by each COPY that completes are added to
+// rowsLoaded.
+func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName string, concurrency int, rowsLoaded *atomic.Int64) (func(string), func() error, func()) {
 	var filesToCopy fileSet
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -662,7 +666,9 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName
 				time.Sleep(backoff)
 			}
 
-			if err := executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy); err != nil {
+			n, err := executeCopyQuery(ctx, cn, copyQ, tableName, &filesToCopy)
+			rowsLoaded.Add(n)
+			if err != nil {
 				return err
 			}
 
@@ -701,30 +707,14 @@ func runCopyTasks(ctx context.Context, cn snowflakeConn, copyQ string, tableName
 			}
 
 			g.Go(func() error {
-				return executeCopyQuery(gCtx, cn, copyQ, tableName, &filesToCopy)
+				n, err := executeCopyQuery(gCtx, cn, copyQ, tableName, &filesToCopy)
+				rowsLoaded.Add(n)
+				return err
 			})
 		}
 	}()
 
 	return readyFn, stopFn, cancelFn
-}
-
-func countRowsInTable(ctx context.Context, db snowflakeConn, tableName string) (rowCount int64, err error) {
-	rows, err := db.QueryContext(ctx, countQuery, []driver.NamedValue{{Value: tableName}})
-	if err != nil {
-		return 0, errToAdbcErr(adbc.StatusIO, err)
-	}
-	defer func() {
-		err = errors.Join(err, rows.Close())
-	}()
-
-	dest := make([]driver.Value, 1)
-	if err := rows.Next(dest); err != nil {
-		return 0, errToAdbcErr(adbc.StatusIO, err)
-	}
-
-	n, err := strconv.Atoi(dest[0].(string))
-	return int64(n), err
 }
 
 // Initializes a sync.Pool of *bytes.Buffer.
