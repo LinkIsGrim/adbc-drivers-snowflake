@@ -349,6 +349,152 @@ func TestTimestampTransformerColumn(t *testing.T) {
 	}
 }
 
+// TestTimestampTransformerRetype checks that compact values already in the
+// output unit are passed through without copying, and that the cases the
+// fast path can't take still match the legacy implementation.
+func TestTimestampTransformerRetype(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(context.Background(), mem)
+
+	ib := array.NewInt64Builder(mem)
+	for i := range 100 {
+		if i%7 == 3 {
+			ib.AppendNull()
+			continue
+		}
+		ib.Append(1717200000_000 + int64(i)*1_001 - 50_000)
+	}
+	compact := ib.NewArray()
+	ib.Release()
+	defer compact.Release()
+
+	sameBuffer := func(t *testing.T, got arrow.Array, values *memory.Buffer) {
+		t.Helper()
+		assert.Same(t, &values.Bytes()[0], &got.Data().Buffers()[1].Bytes()[0], "values were copied")
+	}
+	check := func(t *testing.T, withOffset bool, dt *arrow.TimestampType, scale int64, mode MaxTimestampPrecision, in arrow.Array) arrow.Array {
+		t.Helper()
+		typ := "TIMESTAMP_NTZ"
+		if withOffset {
+			typ = "TIMESTAMP_TZ"
+		}
+		orig := getArrowTimeUnit(scale, Nanoseconds)
+		want, err := legacyTimestampTransformer(typ, dt, scale, orig, mode, nil)(ctx, in)
+		require.NoError(t, err)
+		defer want.Release()
+		got, err := timestampTransformer(withOffset, dt, scale, orig, mode, nil)(ctx, in)
+		require.NoError(t, err)
+		assert.True(t, array.Equal(want, got), "want %v, got %v", want, got)
+		assert.True(t, arrow.TypeEqual(dt, got.DataType()))
+		return got
+	}
+
+	t.Run("compact", func(t *testing.T) {
+		ms := &arrow.TimestampType{Unit: arrow.Millisecond}
+		for _, in := range []arrow.Array{compact, array.NewSlice(compact, 13, 97)} {
+			got := check(t, false, ms, 3, Nanoseconds, in)
+			sameBuffer(t, got, compact.Data().Buffers()[1])
+			if in != compact {
+				in.Release()
+			}
+			got.Release()
+		}
+	})
+
+	t.Run("outlives input", func(t *testing.T) {
+		ib := array.NewInt64Builder(mem)
+		ib.AppendValues([]int64{1, 2, 3}, nil)
+		in := ib.NewArray()
+		ib.Release()
+		got, err := timestampTransformer(false, &arrow.TimestampType{Unit: arrow.Second}, 0, arrow.Second, Nanoseconds, nil)(ctx, in)
+		require.NoError(t, err)
+		in.Release()
+		assert.Equal(t, []arrow.Timestamp{1, 2, 3}, got.(*array.Timestamp).TimestampValues())
+		got.Release()
+	})
+
+	t.Run("no overflow bounds", func(t *testing.T) {
+		ns := &arrow.TimestampType{Unit: arrow.Nanosecond}
+		ib := array.NewInt64Builder(mem)
+		ib.AppendValues([]int64{0, math.MinInt64, 5}, []bool{true, false, true})
+		masked := ib.NewArray()
+		ib.Release()
+		defer masked.Release()
+
+		// An out-of-range value in a null slot doesn't matter.
+		got := check(t, false, ns, 9, NanosecondsNoOverflow, masked)
+		sameBuffer(t, got, masked.Data().Buffers()[1])
+		got.Release()
+
+		ib = array.NewInt64Builder(mem)
+		ib.AppendValues([]int64{0, math.MinInt64}, nil)
+		bad := ib.NewArray()
+		ib.Release()
+		defer bad.Release()
+		orig := arrow.Nanosecond
+		_, wantErr := legacyTimestampTransformer("TIMESTAMP_NTZ", ns, 9, orig, NanosecondsNoOverflow, nil)(ctx, bad)
+		require.Error(t, wantErr)
+		_, gotErr := timestampTransformer(false, ns, 9, orig, NanosecondsNoOverflow, nil)(ctx, bad)
+		require.Error(t, gotErr)
+		assert.Equal(t, wantErr.Error(), gotErr.Error())
+	})
+
+	tzFields := []arrow.Field{{Name: "epoch", Type: arrow.PrimitiveTypes.Int64}, {Name: "timezone", Type: arrow.PrimitiveTypes.Int32}}
+	ms := &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: "UTC"}
+
+	t.Run("struct2", func(t *testing.T) {
+		sb := array.NewStructBuilder(mem, arrow.StructOf(tzFields...))
+		for i := range 100 {
+			if i%7 == 3 {
+				sb.AppendNull()
+				sb.FieldBuilder(0).AppendNull()
+				sb.FieldBuilder(1).AppendNull()
+				continue
+			}
+			sb.Append(true)
+			sb.FieldBuilder(0).(*array.Int64Builder).Append(1717200000_000 + int64(i)*1_001 - 50_000)
+			sb.FieldBuilder(1).(*array.Int32Builder).Append(1440 + int32(i%25-12)*60)
+		}
+		full := sb.NewArray()
+		sb.Release()
+		defer full.Release()
+		epochValues := full.(*array.Struct).Field(0).Data().Buffers()[1]
+		for _, in := range []arrow.Array{full, array.NewSlice(full, 13, 97)} {
+			got := check(t, true, ms, 3, Nanoseconds, in)
+			sameBuffer(t, got, epochValues)
+			if in != full {
+				in.Release()
+			}
+			got.Release()
+		}
+	})
+
+	t.Run("struct2 child offset differs", func(t *testing.T) {
+		// A struct whose children are slices of longer arrays: the struct's
+		// validity starts at 0 but the values don't, so they can't be shared.
+		epochs := array.NewSlice(compact, 10, 60)
+		defer epochs.Release()
+		zb := array.NewInt32Builder(mem)
+		for range 60 {
+			zb.Append(1440 + 120)
+		}
+		zonesFull := zb.NewArray()
+		zb.Release()
+		defer zonesFull.Release()
+		zones := array.NewSlice(zonesFull, 10, 60)
+		defer zones.Release()
+		in, err := array.NewStructArrayWithFields([]arrow.Array{epochs, zones}, tzFields)
+		require.NoError(t, err)
+		defer in.Release()
+		require.NotEqual(t, in.Data().Offset(), in.Field(0).Data().Offset())
+
+		got := check(t, true, ms, 3, Nanoseconds, in)
+		assert.NotSame(t, &compact.Data().Buffers()[1].Bytes()[0], &got.Data().Buffers()[1].Bytes()[0])
+		got.Release()
+	})
+}
+
 func BenchmarkTimestampTransformer(b *testing.B) {
 	r := rand.New(rand.NewPCG(1, 2))
 	const n = 1 << 16
@@ -380,6 +526,7 @@ func BenchmarkTimestampTransformer(b *testing.B) {
 
 	ctx := compute.WithAllocator(context.Background(), memory.DefaultAllocator)
 	ntz := &arrow.TimestampType{Unit: arrow.Nanosecond}
+	us := &arrow.TimestampType{Unit: arrow.Microsecond}
 	tz := &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}
 	cases := []struct {
 		name string
@@ -390,6 +537,12 @@ func BenchmarkTimestampTransformer(b *testing.B) {
 		{"NTZ_scale9/Integer", compact, timestampTransformer(false, ntz, 9, arrow.Nanosecond, Nanoseconds, nil)},
 		{"LTZ_scale9/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_LTZ", ntz, 9, arrow.Nanosecond, Nanoseconds, time.UTC)},
 		{"LTZ_scale9/Integer", compact, timestampTransformer(false, ntz, 9, arrow.Nanosecond, Nanoseconds, time.UTC)},
+		// Same unit, but the bounds check scans the column before retyping.
+		{"NTZ_scale9_NoOverflow/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_NTZ", ntz, 9, arrow.Nanosecond, NanosecondsNoOverflow, nil)},
+		{"NTZ_scale9_NoOverflow/Integer", compact, timestampTransformer(false, ntz, 9, arrow.Nanosecond, NanosecondsNoOverflow, nil)},
+		// Truncated to microseconds, so every value goes through the loop.
+		{"NTZ_scale9_Micro/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_NTZ", us, 9, arrow.Nanosecond, Microseconds, nil)},
+		{"NTZ_scale9_Micro/Integer", compact, timestampTransformer(false, us, 9, arrow.Nanosecond, Microseconds, nil)},
 		{"TZ_struct3/Legacy", tzStruct, legacyTimestampTransformer("TIMESTAMP_TZ", tz, 9, arrow.Nanosecond, Nanoseconds, nil)},
 		{"TZ_struct3/Integer", tzStruct, timestampTransformer(true, tz, 9, arrow.Nanosecond, Nanoseconds, nil)},
 	}
