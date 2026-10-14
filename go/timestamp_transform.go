@@ -137,6 +137,35 @@ func (c *timestampConverter) fromEpochFraction(epoch int64, fraction int32) (arr
 	return arrow.Timestamp(v + frac), true
 }
 
+// isIdentity reports whether compact values are already timestamps of the
+// output unit, as when a column's scale is 3, 6 or 9 and matches it.
+func (c *timestampConverter) isIdentity() bool {
+	return c.mul == 1 && c.div == 1
+}
+
+// inRange reports whether every non-null value in scaled converts without the
+// fallback. a supplies the validity bitmap.
+func (c *timestampConverter) inRange(a arrow.Array, scaled []int64) bool {
+	if c.minScaled == math.MinInt64 && c.maxScaled == math.MaxInt64 {
+		return true
+	}
+	for i, v := range scaled {
+		if (v < c.minScaled || v > c.maxScaled) && a.IsValid(i) {
+			return false
+		}
+	}
+	return true
+}
+
+// retypeTimestamps returns an array of type dt that shares validity and values
+// with offset, without copying. Arrow timestamps are int64 values, so this is
+// the whole conversion when the converter is the identity.
+func retypeTimestamps(dt *arrow.TimestampType, n int, validity, values *memory.Buffer, nulls, offset int) arrow.Array {
+	data := array.NewData(dt, n, []*memory.Buffer{validity, values}, nil, nulls, offset)
+	defer data.Release()
+	return array.MakeFromData(data)
+}
+
 // newTimestampArray allocates the output for a: a values buffer of a.Len()
 // timestamps and a copy of a's validity bitmap.
 func newTimestampArray(ctx context.Context, a arrow.Array) (values, validity *memory.Buffer, out []arrow.Timestamp) {
@@ -216,11 +245,14 @@ func timestampTransformer(withOffset bool, dt *arrow.TimestampType, scale int64,
 	}
 
 	return func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-		values, validity, out := newTimestampArray(ctx, a)
-
 		if a.DataType().ID() != arrow.STRUCT {
 			// Compact form: one int64 scaled by 10^scale.
 			scaled := a.(*array.Int64).Int64Values()
+			if conv.isIdentity() && conv.inRange(a, scaled) {
+				buffers := a.Data().Buffers()
+				return retypeTimestamps(dt, a.Len(), buffers[0], buffers[1], a.NullN(), a.Data().Offset()), nil
+			}
+			values, validity, out := newTimestampArray(ctx, a)
 			err := convertScaled(a, out, scaled, func(i int) (arrow.Timestamp, error) {
 				return toArrow(inLoc(scaledTimestampToTime(scaled[i], conv.scaleDivisor, conv.fractionMultiplier), loc))
 			})
@@ -230,8 +262,15 @@ func timestampTransformer(withOffset bool, dt *arrow.TimestampType, scale int64,
 		structData := a.(*array.Struct)
 		if withOffset && structData.NumField() == 2 {
 			// Compact TIMESTAMP_TZ: scaled int64 plus a time zone offset.
-			scaled := structData.Field(0).(*array.Int64).Int64Values()
+			scaledArr := structData.Field(0).(*array.Int64)
+			scaled := scaledArr.Int64Values()
 			tzoffset := structData.Field(1).(*array.Int32).Int32Values()
+			// The struct's validity and the child's values can be combined
+			// as is only when both start at the same offset.
+			if conv.isIdentity() && scaledArr.Data().Offset() == a.Data().Offset() && conv.inRange(a, scaled) {
+				return retypeTimestamps(dt, a.Len(), a.Data().Buffers()[0], scaledArr.Data().Buffers()[1], a.NullN(), a.Data().Offset()), nil
+			}
+			values, validity, out := newTimestampArray(ctx, a)
 			err := convertScaled(a, out, scaled, func(i int) (arrow.Timestamp, error) {
 				l := snowflakeOffsetLocation(tzoffset[i])
 				return toArrow(scaledTimestampToTime(scaled[i], conv.scaleDivisor, conv.fractionMultiplier).In(l))
@@ -240,6 +279,7 @@ func timestampTransformer(withOffset bool, dt *arrow.TimestampType, scale int64,
 		}
 
 		// Wide form: epoch seconds plus nanoseconds (plus an offset for TIMESTAMP_TZ).
+		values, validity, out := newTimestampArray(ctx, a)
 		epoch := structData.Field(0).(*array.Int64).Int64Values()
 		fraction := structData.Field(1).(*array.Int32).Int32Values()
 		var tzoffset []int32
