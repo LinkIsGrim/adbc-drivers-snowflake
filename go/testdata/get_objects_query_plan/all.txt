@@ -1,136 +1,181 @@
 # Statements GetObjects sends at this depth, sorted. Regenerate with -update.
 
-## no filters: 8 statement(s), 7 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="%" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
-    SHOW COLUMNS /* ADBC:getObjects */ IN ACCOUNT
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
+## no filters: 11 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "OBJ1">
+        DB_NAME="OBJ1" CATALOG="%" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "OBJ2">
+        DB_NAME="OBJ2" CATALOG="%" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "OBJ1"
+    SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "OBJ2"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ1"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ2"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ1"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ2"
     SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN ACCOUNT
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ1"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ2"
 
-## plain names DB/SCH/TBL: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="DB" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## plain names DB/SCH/TBL: 7 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "DB">
+        DB_NAME="DB" CATALOG="%" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "DB"."SCH"."TBL"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'TBL' IN SCHEMA "DB"."SCH"
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
 
-## underscore names MY_DB/MY_SCH/MY_TBL: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="MY_DB" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## underscore names MY_DB/MY_SCH/MY_TBL: 7 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "MY_DB">
+        DB_NAME="MY_DB" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MY_DB"."MY_SCH"."MY_TBL"
     SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
     SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'MY_TBL' IN SCHEMA "MY_DB"."MY_SCH"
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN DATABASE "MY_DB"
     SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
 
-## underscore catalog only MY_DB: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="MY_DB" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## underscore catalog only MY_DB: 6 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "MY_DB">
+        DB_NAME="MY_DB" CATALOG="%" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "MY_DB"
     SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
     SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS IN DATABASE "MY_DB"
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "MY_DB"
     SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
 
-## underscore names matching two databases MULTI_DB/MY_SCH/MY_TBL: 8 statement(s), 6 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="MULTI_DB" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
-    SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MULTI_DB"."MY_SCH"."MY_TBL"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
+## underscore names matching two databases MULTI_DB/MY_SCH/MY_TBL: 13 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "MULTI-DB">
+        DB_NAME="MULTI-DB" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MULTIXDB">
+        DB_NAME="MULTIXDB" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MULTI-DB"."MY_SCH"."MY_TBL"
+    SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MULTIXDB"."MY_SCH"."MY_TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MULTI-DB"."MY_SCH"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MULTIXDB"."MY_SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MULTI-DB"."MY_SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MULTIXDB"."MY_SCH"
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MULTI_DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'MY_TBL' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN ACCOUNT
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN DATABASE "MULTI-DB"
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN DATABASE "MULTIXDB"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MULTI-DB"."MY_SCH"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MULTIXDB"."MY_SCH"
 
 ## underscore names matching no database NO_DB/MY_SCH/MY_TBL: 1 statement(s), 1 IN ACCOUNT
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'NO_DB' IN ACCOUNT
 
-## percent patterns DB%/SCH%/TBL%: 8 statement(s), 7 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="DB%" DB_SCHEMA="SCH%" TABLE="TBL%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## underscore names matching 20 databases MANY_DB/MY_SCH/MY_TBL: 25 statement(s), 5 IN ACCOUNT
+    <queries/get_objects_all.sql in "MANY_DB00">
+        DB_NAME="MANY_DB00" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB01">
+        DB_NAME="MANY_DB01" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB02">
+        DB_NAME="MANY_DB02" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB03">
+        DB_NAME="MANY_DB03" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB04">
+        DB_NAME="MANY_DB04" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB05">
+        DB_NAME="MANY_DB05" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB06">
+        DB_NAME="MANY_DB06" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB07">
+        DB_NAME="MANY_DB07" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB08">
+        DB_NAME="MANY_DB08" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB09">
+        DB_NAME="MANY_DB09" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB10">
+        DB_NAME="MANY_DB10" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB11">
+        DB_NAME="MANY_DB11" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB12">
+        DB_NAME="MANY_DB12" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB13">
+        DB_NAME="MANY_DB13" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB14">
+        DB_NAME="MANY_DB14" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB15">
+        DB_NAME="MANY_DB15" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB16">
+        DB_NAME="MANY_DB16" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB17">
+        DB_NAME="MANY_DB17" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB18">
+        DB_NAME="MANY_DB18" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "MANY_DB19">
+        DB_NAME="MANY_DB19" CATALOG="%" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN ACCOUNT
     SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
     SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB%' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'TBL%' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH%' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MANY_DB' IN ACCOUNT
     SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN ACCOUNT
 
-## plain names with column filter COL: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="DB" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="COL" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
-    SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "DB"."SCH"."TBL"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
-    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'TBL' IN SCHEMA "DB"."SCH"
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+## percent patterns DB%/SCH%/TBL%: 13 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "OBJ1">
+        DB_NAME="OBJ1" CATALOG="%" DB_SCHEMA="SCH%" TABLE="TBL%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    <queries/get_objects_all.sql in "OBJ2">
+        DB_NAME="OBJ2" CATALOG="%" DB_SCHEMA="SCH%" TABLE="TBL%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "OBJ1"
+    SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "OBJ2"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ1"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ2"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ1"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ2"
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB%' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH%' IN DATABASE "OBJ1"
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH%' IN DATABASE "OBJ2"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ1"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "OBJ2"
 
-## plain names with table type VIEW: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="DB" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## plain names with column filter COL: 7 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "DB">
+        DB_NAME="DB" CATALOG="%" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="COL" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "DB"."SCH"."TBL"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB' IN ACCOUNT
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
-    SHOW TERSE /* ADBC:getObjects */ VIEWS LIKE 'TBL' IN SCHEMA "DB"."SCH"
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
 
-## plain names with unknown table type: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql>
-        CATALOG="DB" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## plain names with table type VIEW: 7 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "DB">
+        DB_NAME="DB" CATALOG="%" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "DB"."SCH"."TBL"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
     SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB' IN ACCOUNT
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS LIKE 'TBL' IN SCHEMA "DB"."SCH"
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN TABLE "DB"."SCH"."TBL"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
 
-## match exactly MY_DB/MY_SCH/MY_TBL: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql with LIKE>
-        CATALOG="MY!_DB" DB_SCHEMA="MY!_SCH" TABLE="MY!_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## plain names with unknown table type: 7 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "DB">
+        DB_NAME="DB" CATALOG="%" DB_SCHEMA="SCH" TABLE="TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+    SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "DB"."SCH"."TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "DB"."SCH"
+
+## match exactly MY_DB/MY_SCH/MY_TBL: 7 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "MY_DB" with LIKE>
+        DB_NAME="MY_DB" CATALOG="%" DB_SCHEMA="MY!_SCH" TABLE="MY!_TBL" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN TABLE "MY_DB"."MY_SCH"."MY_TBL"
-    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN TABLE "MY_DB"."MY_SCH"."MY_TBL"
-    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN TABLE "MY_DB"."MY_SCH"."MY_TBL"
+    SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
+    SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
     SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'MY_DB'
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS IN SCHEMA "MY_DB"."MY_SCH" STARTS WITH 'MY_TBL'
     SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "MY_DB" STARTS WITH 'MY_SCH'
-    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN TABLE "MY_DB"."MY_SCH"."MY_TBL"
+    SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN SCHEMA "MY_DB"."MY_SCH"
 
-## match exactly catalog only MY_DB: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql with LIKE>
-        CATALOG="MY!_DB" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
+## match exactly catalog only MY_DB: 6 statement(s), 1 IN ACCOUNT
+    <queries/get_objects_all.sql in "MY_DB" with LIKE>
+        DB_NAME="MY_DB" CATALOG="%" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
     SHOW COLUMNS /* ADBC:getObjects */ IN DATABASE "MY_DB"
     SHOW IMPORTED KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
     SHOW PRIMARY KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
     SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'MY_DB'
-    SHOW TERSE /* ADBC:getObjects */ OBJECTS IN DATABASE "MY_DB"
-    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "MY_DB"
     SHOW UNIQUE KEYS /* ADBC:getObjectsTables */ IN DATABASE "MY_DB"
 
-## match exactly empty schema: 8 statement(s), 1 IN ACCOUNT
-    <queries/get_objects_all.sql with LIKE>
-        CATALOG="DB" DB_SCHEMA="" TABLE="%" COLUMN="%" PK_QUERY_ID="<id>" FK_QUERY_ID="<id>" UNIQUE_QUERY_ID="<id>" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="<id>" SHOW_COLUMNS_QUERY_ID="<id>"
-    SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "column_name", NULL::VARCHAR AS "data_type" WHERE FALSE
-    SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "constraint_name", NULL::VARCHAR AS "column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE
-    SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "constraint_name", NULL::VARCHAR AS "column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE
-    SELECT NULL::VARCHAR AS "fk_database_name", NULL::VARCHAR AS "fk_schema_name", NULL::VARCHAR AS "fk_table_name", NULL::VARCHAR AS "fk_name", NULL::VARCHAR AS "fk_column_name", NULL::VARCHAR AS "pk_database_name", NULL::VARCHAR AS "pk_schema_name", NULL::VARCHAR AS "pk_table_name", NULL::VARCHAR AS "pk_column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE
-    SELECT NULL::VARCHAR AS "name", NULL::VARCHAR AS "database_name" WHERE FALSE
-    SELECT NULL::VARCHAR AS "name", NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "kind" WHERE FALSE
+## match exactly empty schema: 1 statement(s), 1 IN ACCOUNT
     SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT STARTS WITH 'DB'
