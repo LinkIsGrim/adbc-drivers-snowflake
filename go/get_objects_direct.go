@@ -28,63 +28,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// This file contains optimized implementations of GetObjects that read SHOW
-// TERSE results directly instead of going through RESULT_SCAN SQL templates.
-// This reduces the number of Snowflake round-trips for common query patterns.
-//
-// The key optimization targets ObjectDepthTables with a specific catalog:
-//   - Specific catalog + specific schema: 1 query instead of 4
-//   - Specific catalog + wildcard schema: 2 parallel queries instead of 4
-//
-// ObjectDepthDBSchemas with specific catalog: 1 query instead of 3
+// This file reads SHOW TERSE results directly, instead of going through
+// RESULT_SCAN SQL templates, to build one catalog of a DBSchemas- or
+// Tables-depth GetObjects result.
 
-// getObjectsDirectPath attempts to handle GetObjects more efficiently by
-// reading SHOW TERSE results directly. Returns (nil, nil) if no fast path
-// applies, signaling the caller to use the existing SQL template path.
-func (c *connectionImpl) getObjectsDirectPath(
-	ctx context.Context,
-	depth adbc.ObjectDepth,
-	scope *getObjectsScope,
-	dbSchema, tableName *string,
-	tableType []string,
-	hasViews, hasTables bool,
-) (array.RecordReader, error) {
-	switch depth {
-	case adbc.ObjectDepthDBSchemas:
-		if scope.catalog != nil {
-			return c.getObjectsDBSchemasDirect(ctx, *scope.catalog, dbSchema)
-		}
-	case adbc.ObjectDepthTables:
-		if len(tableType) > 0 && !hasViews && !hasTables {
-			// tableType was specified but doesn't include TABLE or VIEW:
-			// return an empty result without any round-trips.
-			return buildGetObjectsResult(c.Alloc)
-		}
-		if scope.catalog != nil {
-			if scope.dbSchema != nil {
-				return c.getObjectsTablesDirect(ctx, *scope.catalog, scope.dbSchema, tableName, tableType, true)
-			}
-			return c.getObjectsTablesDirect(ctx, *scope.catalog, dbSchema, tableName, tableType, false)
-		}
-	}
-
-	return nil, nil
-}
-
-// getObjectsDBSchemasDirect handles ObjectDepthDBSchemas with a specific
-// catalog. Executes 1 SHOW query instead of 3 (2 SHOW + 1 RESULT_SCAN SQL).
-func (c *connectionImpl) getObjectsDBSchemasDirect(
-	ctx context.Context,
-	catalog string,
-	dbSchema *string,
-) (array.RecordReader, error) {
-	var schemas []schemaEntry
-	var err error
-	if !hasEmptyLiteralFilter(c.matchExactly, &catalog, dbSchema) {
-		schemas, err = c.execShowSchemas(ctx, dbSchema, " IN DATABASE "+quoteTblName(catalog))
-	}
+// getObjectsDBSchemasIn returns the schemas of catalog that match dbSchema,
+// with 1 SHOW query.
+func (c *connectionImpl) getObjectsDBSchemasIn(ctx context.Context, catalog string, dbSchema *string) (driverbase.GetObjectsInfo, error) {
+	schemas, err := c.execShowSchemas(ctx, dbSchema, " IN DATABASE "+quoteTblName(catalog))
 	if err != nil {
-		return nil, err
+		return driverbase.GetObjectsInfo{}, err
 	}
 
 	dbSchemas := make([]driverbase.DBSchemaInfo, 0, len(schemas))
@@ -94,119 +47,91 @@ func (c *connectionImpl) getObjectsDBSchemasDirect(
 			DbSchemaName: &sn,
 		})
 	}
-
-	cat := catalog
-	return buildGetObjectsResult(c.Alloc, driverbase.GetObjectsInfo{
-		CatalogName:      &cat,
-		CatalogDbSchemas: dbSchemas,
-	})
+	return driverbase.GetObjectsInfo{CatalogName: &catalog, CatalogDbSchemas: dbSchemas}, nil
 }
 
-// getObjectsTablesDirect handles ObjectDepthTables with a specific catalog.
-//   - With specific schema: 1 SHOW query (instead of 4)
-//   - With wildcard/nil schema: 2 parallel SHOW queries (instead of 4)
-func (c *connectionImpl) getObjectsTablesDirect(
-	ctx context.Context,
-	catalog string,
-	dbSchema, tableName *string,
-	tableType []string,
-	specificSchema bool,
-) (array.RecordReader, error) {
-	objType := showObjType(tableType)
-	escapedCatalog := quoteTblName(catalog)
-
-	if specificSchema {
-		return c.getObjectsTablesInSchema(ctx, catalog, *dbSchema, tableName, objType, escapedCatalog)
-	}
-	return c.getObjectsTablesInDatabase(ctx, catalog, dbSchema, tableName, objType, escapedCatalog)
-}
-
-// getObjectsTablesInSchema is the most optimized path: specific catalog + schema.
-// Executes a single SHOW TERSE query and builds the GetObjects result in Go.
-func (c *connectionImpl) getObjectsTablesInSchema(
-	ctx context.Context,
-	catalog, dbSchema string,
-	tableName *string,
-	objType, escapedCatalog string,
-) (array.RecordReader, error) {
-	suffix := " IN SCHEMA " + escapedCatalog + "." + quoteTblName(dbSchema)
-	var entries []tableEntry
-	var err error
-	if !hasEmptyLiteralFilter(c.matchExactly, &catalog, &dbSchema, tableName) {
-		entries, err = c.execShowTables(ctx, objType, tableName, suffix)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	tables := make([]driverbase.TableInfo, 0, len(entries))
-	for _, e := range entries {
-		tables = append(tables, driverbase.TableInfo{
-			TableName: e.tableName,
-			TableType: e.tableType,
-		})
-	}
-
-	cat := catalog
-	sch := dbSchema
-	return buildGetObjectsResult(c.Alloc, driverbase.GetObjectsInfo{
-		CatalogName: &cat,
-		CatalogDbSchemas: []driverbase.DBSchemaInfo{{
-			DbSchemaName:   &sch,
-			DbSchemaTables: tables,
-		}},
-	})
-}
-
-// getObjectsTablesInDatabase handles specific catalog with wildcard/nil schema.
-// Executes 2 parallel SHOW TERSE queries and groups results in Go.
-func (c *connectionImpl) getObjectsTablesInDatabase(
-	ctx context.Context,
-	catalog string,
-	dbSchema, tableName *string,
-	objType, escapedCatalog string,
-) (array.RecordReader, error) {
+// getObjectsTablesIn returns the schemas of catalog that match dbSchema, with
+// their tables that match tableName.
+//   - No schema filter: 2 parallel SHOW queries over the database.
+//   - A schema filter that matches one schema: SHOW SCHEMAS, then SHOW
+//     TABLES in that schema. A literal schema name runs both at once.
+//   - A schema filter that matches several: SHOW SCHEMAS, then SHOW TABLES
+//     over the database.
+func (c *connectionImpl) getObjectsTablesIn(ctx context.Context, catalog string, dbSchema, tableName *string, objType string) (driverbase.GetObjectsInfo, error) {
 	var (
 		schemas      []schemaEntry
 		tableEntries []tableEntry
 	)
+	escapedCatalog := quoteTblName(catalog)
+	dbSuffix := " IN DATABASE " + escapedCatalog
 
-	if !hasEmptyLiteralFilter(c.matchExactly, &catalog, dbSchema) {
-		dbSuffix := " IN DATABASE " + escapedCatalog
+	if matchesAll(dbSchema, c.matchExactly) {
 		g, gCtx := errgroup.WithContext(ctx)
-		g.Go(func() error {
-			var err error
+		g.Go(func() (err error) {
 			schemas, err = c.execShowSchemas(gCtx, dbSchema, dbSuffix)
 			return err
 		})
-		g.Go(func() error {
-			var err error
+		g.Go(func() (err error) {
 			tableEntries, err = c.execShowTables(gCtx, objType, tableName, dbSuffix)
 			return err
 		})
-
 		if err := g.Wait(); err != nil {
-			return nil, err
+			return driverbase.GetObjectsInfo{}, err
+		}
+	} else {
+		// A literal schema filter is usually the schema's exact name, so list
+		// that schema's tables while SHOW SCHEMAS confirms it.
+		type showResult struct {
+			entries []tableEntry
+			err     error
+		}
+		var guessed chan showResult
+		guess := literalScope(nil, dbSchema, c.matchExactly).dbSchema
+		if guess != nil {
+			guessCtx, cancelGuess := context.WithCancel(ctx)
+			defer cancelGuess()
+			guessed = make(chan showResult, 1)
+			go func() {
+				entries, err := c.execShowTables(guessCtx, objType, tableName, " IN SCHEMA "+escapedCatalog+"."+quoteTblName(*guess))
+				guessed <- showResult{entries, err}
+			}()
+		}
+
+		var err error
+		if schemas, err = c.execShowSchemas(ctx, dbSchema, dbSuffix); err != nil {
+			return driverbase.GetObjectsInfo{}, err
+		}
+		switch {
+		case len(schemas) == 0:
+			return driverbase.GetObjectsInfo{CatalogName: &catalog, CatalogDbSchemas: []driverbase.DBSchemaInfo{}}, nil
+		case len(schemas) == 1 && guess != nil && schemas[0].schemaName == *guess:
+			r := <-guessed
+			if r.err != nil {
+				return driverbase.GetObjectsInfo{}, r.err
+			}
+			tableEntries = r.entries
+		default:
+			suffix := dbSuffix
+			if len(schemas) == 1 {
+				suffix = " IN SCHEMA " + escapedCatalog + "." + quoteTblName(schemas[0].schemaName)
+			}
+			if tableEntries, err = c.execShowTables(ctx, objType, tableName, suffix); err != nil {
+				return driverbase.GetObjectsInfo{}, err
+			}
 		}
 	}
 
-	// Build set of matching schema names for filtering
-	schemaSet := make(map[string]struct{}, len(schemas))
-	for _, s := range schemas {
-		schemaSet[s.schemaName] = struct{}{}
-	}
-
 	// Group tables by schema, only including tables in matching schemas
-	tablesBySchema := make(map[string][]driverbase.TableInfo)
+	tablesBySchema := make(map[string][]driverbase.TableInfo, len(schemas))
+	for _, s := range schemas {
+		tablesBySchema[s.schemaName] = []driverbase.TableInfo{}
+	}
 	for _, e := range tableEntries {
-		if _, ok := schemaSet[e.schemaName]; ok {
-			tablesBySchema[e.schemaName] = append(
-				tablesBySchema[e.schemaName],
-				driverbase.TableInfo{
-					TableName: e.tableName,
-					TableType: e.tableType,
-				},
-			)
+		if tables, ok := tablesBySchema[e.schemaName]; ok {
+			tablesBySchema[e.schemaName] = append(tables, driverbase.TableInfo{
+				TableName: e.tableName,
+				TableType: e.tableType,
+			})
 		}
 	}
 
@@ -214,21 +139,12 @@ func (c *connectionImpl) getObjectsTablesInDatabase(
 	dbSchemas := make([]driverbase.DBSchemaInfo, 0, len(schemas))
 	for _, s := range schemas {
 		sn := s.schemaName
-		tables := tablesBySchema[sn]
-		if tables == nil {
-			tables = []driverbase.TableInfo{}
-		}
 		dbSchemas = append(dbSchemas, driverbase.DBSchemaInfo{
 			DbSchemaName:   &sn,
-			DbSchemaTables: tables,
+			DbSchemaTables: tablesBySchema[sn],
 		})
 	}
-
-	cat := catalog
-	return buildGetObjectsResult(c.Alloc, driverbase.GetObjectsInfo{
-		CatalogName:      &cat,
-		CatalogDbSchemas: dbSchemas,
-	})
+	return driverbase.GetObjectsInfo{CatalogName: &catalog, CatalogDbSchemas: dbSchemas}, nil
 }
 
 type tableEntry struct {
