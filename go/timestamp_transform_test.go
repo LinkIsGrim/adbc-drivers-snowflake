@@ -495,67 +495,117 @@ func TestTimestampTransformerRetype(t *testing.T) {
 	})
 }
 
+// BenchmarkTimestampTransformer uses the representations Snowflake sends:
+// TIMESTAMP_NTZ/LTZ are int64 up to scale 7 and (epoch, fraction) above it, and
+// TIMESTAMP_TZ is (epoch, timezone) up to scale 3 and (epoch, fraction,
+// timezone) above it.
 func BenchmarkTimestampTransformer(b *testing.B) {
 	r := rand.New(rand.NewPCG(1, 2))
 	const n = 1 << 16
-	ib := array.NewInt64Builder(memory.DefaultAllocator)
-	for i := range n {
-		if i%17 == 0 {
-			ib.AppendNull()
-			continue
+	const epochSeconds = 1717200000
+	compact := func(scale int64) arrow.Array {
+		pow := int64(math.Pow10(int(scale)))
+		ib := array.NewInt64Builder(memory.DefaultAllocator)
+		defer ib.Release()
+		for i := range n {
+			if i%17 == 0 {
+				ib.AppendNull()
+				continue
+			}
+			ib.Append((epochSeconds+r.Int64N(1e9)-5e8)*pow + r.Int64N(pow))
 		}
-		ib.Append(1717200000_000000000 + r.Int64N(1e18) - 5e17)
+		return ib.NewArray()
 	}
-	compact := ib.NewArray()
-	ib.Release()
-	defer compact.Release()
+	structOf := func(fields ...string) arrow.Array {
+		var fs []arrow.Field
+		for _, f := range fields {
+			typ := arrow.DataType(arrow.PrimitiveTypes.Int32)
+			if f == "epoch" {
+				typ = arrow.PrimitiveTypes.Int64
+			}
+			fs = append(fs, arrow.Field{Name: f, Type: typ})
+		}
+		sb := array.NewStructBuilder(memory.DefaultAllocator, arrow.StructOf(fs...))
+		defer sb.Release()
+		for i := range n {
+			if i%17 == 0 {
+				sb.AppendNull()
+				for f := range fs {
+					sb.FieldBuilder(f).AppendNull()
+				}
+				continue
+			}
+			sb.Append(true)
+			for f, name := range fields {
+				switch name {
+				case "epoch":
+					if len(fields) == 2 && fields[1] == "timezone" {
+						// Compact TIMESTAMP_TZ at scale 3.
+						sb.FieldBuilder(f).(*array.Int64Builder).Append((epochSeconds+r.Int64N(1e9)-5e8)*1000 + r.Int64N(1000))
+					} else {
+						sb.FieldBuilder(f).(*array.Int64Builder).Append(epochSeconds + r.Int64N(1e9) - 5e8)
+					}
+				case "fraction":
+					sb.FieldBuilder(f).(*array.Int32Builder).Append(r.Int32N(1e9))
+				case "timezone":
+					sb.FieldBuilder(f).(*array.Int32Builder).Append(1440 + 60)
+				}
+			}
+		}
+		return sb.NewArray()
+	}
 
-	sb := array.NewStructBuilder(memory.DefaultAllocator, arrow.StructOf(
-		arrow.Field{Name: "epoch", Type: arrow.PrimitiveTypes.Int64},
-		arrow.Field{Name: "fraction", Type: arrow.PrimitiveTypes.Int32},
-		arrow.Field{Name: "timezone", Type: arrow.PrimitiveTypes.Int32}))
-	for range n {
-		sb.Append(true)
-		sb.FieldBuilder(0).(*array.Int64Builder).Append(1717200000 + r.Int64N(1e9) - 5e8)
-		sb.FieldBuilder(1).(*array.Int32Builder).Append(r.Int32N(1e9))
-		sb.FieldBuilder(2).(*array.Int32Builder).Append(1440 + 60)
+	ntz6, ntz7 := compact(6), compact(7)
+	ntz9 := structOf("epoch", "fraction")
+	tz3 := structOf("epoch", "timezone")
+	tz9 := structOf("epoch", "fraction", "timezone")
+	for _, a := range []arrow.Array{ntz6, ntz7, ntz9, tz3, tz9} {
+		defer a.Release()
 	}
-	tzStruct := sb.NewArray()
-	sb.Release()
-	defer tzStruct.Release()
 
 	ctx := compute.WithAllocator(context.Background(), memory.DefaultAllocator)
-	ntz := &arrow.TimestampType{Unit: arrow.Nanosecond}
-	us := &arrow.TimestampType{Unit: arrow.Microsecond}
-	tz := &arrow.TimestampType{Unit: arrow.Nanosecond, TimeZone: "UTC"}
 	cases := []struct {
-		name string
-		in   arrow.Array
-		fn   colTransformer
+		name       string
+		in         arrow.Array
+		typ        string
+		scale      int64
+		mode       MaxTimestampPrecision
+		withOffset bool
 	}{
-		{"NTZ_scale9/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_NTZ", ntz, 9, arrow.Nanosecond, Nanoseconds, nil)},
-		{"NTZ_scale9/Integer", compact, timestampTransformer(false, ntz, 9, arrow.Nanosecond, Nanoseconds, nil)},
-		{"LTZ_scale9/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_LTZ", ntz, 9, arrow.Nanosecond, Nanoseconds, time.UTC)},
-		{"LTZ_scale9/Integer", compact, timestampTransformer(false, ntz, 9, arrow.Nanosecond, Nanoseconds, time.UTC)},
-		// Same unit, but the bounds check scans the column before retyping.
-		{"NTZ_scale9_NoOverflow/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_NTZ", ntz, 9, arrow.Nanosecond, NanosecondsNoOverflow, nil)},
-		{"NTZ_scale9_NoOverflow/Integer", compact, timestampTransformer(false, ntz, 9, arrow.Nanosecond, NanosecondsNoOverflow, nil)},
-		// Truncated to microseconds, so every value goes through the loop.
-		{"NTZ_scale9_Micro/Legacy", compact, legacyTimestampTransformer("TIMESTAMP_NTZ", us, 9, arrow.Nanosecond, Microseconds, nil)},
-		{"NTZ_scale9_Micro/Integer", compact, timestampTransformer(false, us, 9, arrow.Nanosecond, Microseconds, nil)},
-		{"TZ_struct3/Legacy", tzStruct, legacyTimestampTransformer("TIMESTAMP_TZ", tz, 9, arrow.Nanosecond, Nanoseconds, nil)},
-		{"TZ_struct3/Integer", tzStruct, timestampTransformer(true, tz, 9, arrow.Nanosecond, Nanoseconds, nil)},
+		// Already in the output unit: passed through.
+		{"NTZ_6", ntz6, "TIMESTAMP_NTZ", 6, Nanoseconds, false},
+		{"TZ_3", tz3, "TIMESTAMP_TZ", 3, Nanoseconds, true},
+		// Rescaled per value.
+		{"NTZ_7", ntz7, "TIMESTAMP_NTZ", 7, Nanoseconds, false},
+		{"NTZ_9", ntz9, "TIMESTAMP_NTZ", 9, Nanoseconds, false},
+		{"NTZ_9_Micro", ntz9, "TIMESTAMP_NTZ", 9, Microseconds, false},
+		{"TZ_9", tz9, "TIMESTAMP_TZ", 9, Nanoseconds, true},
 	}
 	for _, c := range cases {
-		b.Run(c.name, func(b *testing.B) {
-			b.ReportAllocs()
-			for b.Loop() {
-				out, err := c.fn(ctx, c.in)
-				if err != nil {
-					b.Fatal(err)
+		tz := ""
+		if c.withOffset {
+			tz = "UTC"
+		}
+		dt := &arrow.TimestampType{Unit: getArrowTimeUnit(c.scale, c.mode), TimeZone: tz}
+		orig := getArrowTimeUnit(c.scale, Nanoseconds)
+		impls := []struct {
+			name string
+			fn   colTransformer
+		}{
+			{"Legacy", legacyTimestampTransformer(c.typ, dt, c.scale, orig, c.mode, nil)},
+			{"Integer", timestampTransformer(c.withOffset, dt, c.scale, orig, c.mode, nil)},
+		}
+		for _, impl := range impls {
+			b.Run(c.name+"/"+impl.name, func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					out, err := impl.fn(ctx, c.in)
+					if err != nil {
+						b.Fatal(err)
+					}
+					out.Release()
 				}
-				out.Release()
-			}
-		})
+			})
+		}
 	}
 }
