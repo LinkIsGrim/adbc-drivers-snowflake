@@ -43,8 +43,10 @@ type timestampConverter struct {
 	minScaled, maxScaled int64
 
 	// Struct values (epoch seconds, nanoseconds) become
-	// epoch*unitsPerSecond + nanoseconds/nanosPerUnit.
+	// epoch*unitsPerSecond + nanoseconds/nanosPerUnit. Epochs outside
+	// [minEpoch, maxEpoch] take the fallback.
 	unitsPerSecond, nanosPerUnit int64
+	minEpoch, maxEpoch           int64
 	// checkNanoOverflow mirrors the NanosecondsNoOverflow check in
 	// getArrowTimestampFromTime.
 	checkNanoOverflow bool
@@ -75,6 +77,7 @@ func newTimestampConverter(scale int64, unit, originalArrowUnit arrow.TimeUnit, 
 	}
 	c.unitsPerSecond = int64(math.Pow10(3 * int(unit)))
 	c.nanosPerUnit = 1_000_000_000 / c.unitsPerSecond
+	c.minEpoch, c.maxEpoch = math.MinInt64/c.unitsPerSecond, math.MaxInt64/c.unitsPerSecond
 
 	pow := int64(math.Pow10(int(scale)))
 	if digits := 3*int64(unit) - scale; digits >= 0 {
@@ -86,6 +89,8 @@ func newTimestampConverter(scale int64, unit, originalArrowUnit arrow.TimeUnit, 
 		c.div = int64(math.Pow10(int(-digits)))
 	}
 	if c.checkNanoOverflow {
+		c.minEpoch = max(c.minEpoch, noOverflowMinSeconds+1)
+		c.maxEpoch = min(c.maxEpoch, noOverflowMaxSeconds-1)
 		// floor(scaled / 10^scale) must stay strictly inside the bounds.
 		if noOverflowMaxSeconds <= math.MaxInt64/pow {
 			c.maxScaled = min(c.maxScaled, noOverflowMaxSeconds*pow-1)
@@ -123,14 +128,14 @@ func (c *timestampConverter) fromEpochFraction(epoch int64, fraction int32) (arr
 	if fraction < 0 || fraction >= 1e9 {
 		return 0, false
 	}
-	if c.checkNanoOverflow && (epoch >= noOverflowMaxSeconds || epoch <= noOverflowMinSeconds) {
-		return 0, false
-	}
-	if epoch > math.MaxInt64/c.unitsPerSecond || epoch < math.MinInt64/c.unitsPerSecond {
+	if epoch < c.minEpoch || epoch > c.maxEpoch {
 		return 0, false
 	}
 	v := epoch * c.unitsPerSecond
-	frac := int64(fraction) / c.nanosPerUnit
+	frac := int64(fraction)
+	if c.nanosPerUnit != 1 {
+		frac /= c.nanosPerUnit
+	}
 	if v > math.MaxInt64-frac {
 		return 0, false
 	}
