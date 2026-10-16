@@ -646,9 +646,6 @@ func validateGeoOutputFormat(optionName, value string) error {
 	}
 }
 
-// connectorConfig returns a copy of the database config for a new connection.
-// The Params map is copied too, so that per-connection defaults are never
-// written into the map shared by every connection opened from this database.
 func (d *databaseImpl) connectorConfig() gosnowflake.Config {
 	cfg := *d.cfg
 	cfg.Params = make(map[string]*string, len(d.cfg.Params)+2)
