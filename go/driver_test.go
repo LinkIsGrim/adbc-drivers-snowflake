@@ -1914,6 +1914,42 @@ func (suite *SnowflakeTests) TestUntypedNullLiteral() {
 		"SELECT NULL: expected utf8, got %s", rdr.Schema().Field(0).Type)
 }
 
+// A JSON result large enough to arrive in several chunks comes back complete
+// and in order.
+func (suite *SnowflakeTests) TestQueryJSONMultipleChunks() {
+	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, suite.Quirks.DatabaseOptions())
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
+	cnxn, err := db.Open(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), cnxn, suite.ctx)
+
+	stmt, err := cnxn.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), stmt, suite.ctx)
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, "ALTER SESSION SET GO_QUERY_RESULT_FORMAT = 'JSON'"))
+	_, err = stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	const numRows = 300_000
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, fmt.Sprintf(
+		"SELECT seq4() AS i, randstr(40, random(42)) AS s FROM TABLE(GENERATOR(ROWCOUNT => %d)) ORDER BY i", numRows)))
+	rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	var next int64
+	for rdr.Next() {
+		col := rdr.RecordBatch().Column(0)
+		for i := range col.Len() {
+			suite.Require().Equal(fmt.Sprint(next), col.ValueStr(i), "row %d", next)
+			next++
+		}
+	}
+	suite.Require().NoError(rdr.Err())
+	suite.EqualValues(numRows, next)
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = driver.OptionValueMicroseconds
