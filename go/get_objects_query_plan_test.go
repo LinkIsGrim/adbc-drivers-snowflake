@@ -31,6 +31,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var reGetObjectsAll = regexp.MustCompile(`FROM ("(?:[^"]|"")*")\.information_schema\.columns`)
+
 var updateGolden = flag.Bool("update", false, "rewrite golden files under testdata/ instead of comparing against them")
 
 // describeStatement renders a statement for a query-plan snapshot. SHOW and
@@ -38,12 +40,20 @@ var updateGolden = flag.Bool("update", false, "rewrite golden files under testda
 // are shown by file name along with their bound arguments.
 func describeStatement(st recordedStatement) string {
 	templates := []struct{ name, sql string }{
-		{"queries/get_objects_all.sql", queryGetObjectsAll},
 		{"queries/get_objects_dbschemas.sql", queryGetObjectsDbSchemas},
 		{"queries/get_objects_tables.sql", queryGetObjectsTables},
 		{"queries/get_objects_terse_catalogs.sql", queryGetObjectsTerseCatalogs},
 	}
 	desc := st.Query
+	if m := reGetObjectsAll.FindStringSubmatch(st.Query); m != nil {
+		all := fmt.Sprintf(queryGetObjectsAll, m[1])
+		switch st.Query {
+		case all:
+			desc = "<queries/get_objects_all.sql in " + m[1] + ">"
+		case strings.ReplaceAll(all, " ILIKE ", " LIKE "):
+			desc = "<queries/get_objects_all.sql in " + m[1] + " with LIKE>"
+		}
+	}
 	for _, tmpl := range templates {
 		if st.Query == tmpl.sql {
 			desc = "<" + tmpl.name + ">"
@@ -96,6 +106,7 @@ func TestGetObjectsQueryPlan(t *testing.T) {
 		{name: "underscore catalog only MY_DB", catalog: sp("MY_DB")},
 		{name: "underscore names matching two databases MULTI_DB/MY_SCH/MY_TBL", catalog: sp("MULTI_DB"), dbSchema: sp("MY_SCH"), tableName: sp("MY_TBL")},
 		{name: "underscore names matching no database NO_DB/MY_SCH/MY_TBL", catalog: sp("NO_DB"), dbSchema: sp("MY_SCH"), tableName: sp("MY_TBL")},
+		{name: "underscore names matching 20 databases MANY_DB/MY_SCH/MY_TBL", catalog: sp("MANY_DB"), dbSchema: sp("MY_SCH"), tableName: sp("MY_TBL")},
 		{name: "percent patterns DB%/SCH%/TBL%", catalog: sp("DB%"), dbSchema: sp("SCH%"), tableName: sp("TBL%")},
 		{name: "plain names with column filter COL", catalog: sp("DB"), dbSchema: sp("SCH"), tableName: sp("TBL"), columnName: sp("COL")},
 		{name: "plain names with table type VIEW", catalog: sp("DB"), dbSchema: sp("SCH"), tableName: sp("TBL"), tableType: []string{"VIEW"}},
@@ -153,21 +164,34 @@ func TestGetObjectsQueryPlan(t *testing.T) {
 	}
 }
 
-var reShowTerseLike = regexp.MustCompile(`^SHOW TERSE /\* ADBC:getObjects \*/ (DATABASES|SCHEMAS) LIKE '([^']*)'`)
+var (
+	reShowTerse           = regexp.MustCompile(`^SHOW TERSE /\* ADBC:getObjects \*/ (DATABASES|SCHEMAS)(?: LIKE '([^']*)')?`)
+	reShowTerseStartsWith = regexp.MustCompile(` STARTS WITH '([^']*)'$`)
+)
 
-// fakeAccountShowTerse answers SHOW TERSE DATABASES/SCHEMAS LIKE queries the
-// way an account would: a pattern starting with MULTI matches two objects, one
-// starting with NO_ matches none, and any other pattern matches one object
-// named like the pattern. Everything else gets the default empty result.
+// fakeAccountShowTerse answers SHOW TERSE DATABASES/SCHEMAS queries the way an
+// account would: no pattern matches two objects (OBJ1 and OBJ2), a pattern
+// starting with MULTI matches two objects, one starting with MANY matches 20,
+// one starting with NO_ matches none, and any other pattern matches one object
+// named like the pattern. STARTS WITH 'X' (match_exactly) matches X and
+// X_EXTRA. Everything else gets the default empty result.
 func fakeAccountShowTerse(query string) (driver.Rows, error) {
-	m := reShowTerseLike.FindStringSubmatch(query)
+	m := reShowTerse.FindStringSubmatch(query)
 	if m == nil {
 		return nil, nil
 	}
 	pattern := m[2]
 	rows := &fakeRows{Cols: []string{"created_on", "name", "kind", "database_name", "schema_name"}}
 	var names []string
-	switch {
+	switch sw := reShowTerseStartsWith.FindStringSubmatch(query); {
+	case sw != nil:
+		names = []string{sw[1], sw[1] + "_EXTRA"}
+	case pattern == "" || strings.Contains(pattern, "%"):
+		names = []string{"OBJ1", "OBJ2"}
+	case strings.HasPrefix(pattern, "MANY"):
+		for i := range 20 {
+			names = append(names, fmt.Sprintf("%s%02d", pattern, i))
+		}
 	case strings.HasPrefix(pattern, "MULTI"):
 		names = []string{strings.Replace(pattern, "_", "-", 1), strings.Replace(pattern, "_", "X", 1)}
 	case strings.HasPrefix(pattern, "NO_"):
