@@ -195,6 +195,13 @@ func emptyShowTerseQuery(objType string) (string, error) {
 }
 
 func showTerseQuery(objType string, catalog, dbSchema, tableName *string, matchExactly bool) (string, error) {
+	scope := literalScope(catalog, dbSchema, matchExactly)
+	return scope.showTerseQuery(objType, catalog, dbSchema, tableName, matchExactly)
+}
+
+// showTerseQuery builds the SHOW TERSE query for objType, filtered by the
+// catalog, dbSchema and tableName patterns and scoped as narrowly as s allows.
+func (s *getObjectsScope) showTerseQuery(objType string, catalog, dbSchema, tableName *string, matchExactly bool) (string, error) {
 	var pattern *string
 	var suffix string
 	switch objType {
@@ -208,22 +215,22 @@ func showTerseQuery(objType string, catalog, dbSchema, tableName *string, matchE
 		if hasEmptyLiteralFilter(matchExactly, catalog, dbSchema) {
 			return emptyShowTerseQuery(objType)
 		}
-		if catalog == nil || (!matchExactly && isWildcardStr(*catalog)) {
+		if s.catalog == nil {
 			suffix = " IN ACCOUNT"
 		} else {
-			suffix = " IN DATABASE " + quoteIdentifier(*catalog)
+			suffix = " IN DATABASE " + quoteIdentifier(*s.catalog)
 		}
 	case objViews, objTables, objObjects:
 		pattern = tableName
 		if hasEmptyLiteralFilter(matchExactly, catalog, dbSchema, tableName) {
 			return emptyShowTerseQuery(objType)
 		}
-		if catalog == nil || (!matchExactly && isWildcardStr(*catalog)) {
+		if s.catalog == nil {
 			suffix = " IN ACCOUNT"
-		} else if dbSchema == nil || (!matchExactly && isWildcardStr(*dbSchema)) {
-			suffix = " IN DATABASE " + quoteIdentifier(*catalog)
+		} else if s.dbSchema == nil {
+			suffix = " IN DATABASE " + quoteIdentifier(*s.catalog)
 		} else {
-			suffix = " IN SCHEMA " + quoteIdentifier(*catalog) + "." + quoteIdentifier(*dbSchema)
+			suffix = " IN SCHEMA " + quoteIdentifier(*s.catalog) + "." + quoteIdentifier(*s.dbSchema)
 		}
 	default:
 		return "", fmt.Errorf("unimplemented object type")
@@ -231,13 +238,26 @@ func showTerseQuery(objType string, catalog, dbSchema, tableName *string, matchE
 	return buildShowTerseQuery(objType, pattern, suffix, matchExactly), nil
 }
 
-func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, catalog, dbSchema, tableName *string, matchExactly bool, outQueryID *string) {
+// goGetQueryID dispatches a SHOW TERSE query for objType, filtered by the
+// catalog, dbSchema and tableName patterns and scoped as narrowly as scope
+// allows, and stores its query ID. Queries already run while resolving the
+// scope are not repeated.
+func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup.Group, objType string, scope *getObjectsScope, catalog, dbSchema, tableName *string, matchExactly bool, outQueryID *string) {
+	switch {
+	case objType == objDatabases && scope.dbQueryID != "":
+		*outQueryID = scope.dbQueryID
+		return
+	case objType == objSchemas && scope.schemaQueryID != "":
+		*outQueryID = scope.schemaQueryID
+		return
+	}
+
 	grp.Go(func() error {
 		emptyQuery, err := emptyShowTerseQuery(objType)
 		if err != nil {
 			return err
 		}
-		query, err := showTerseQuery(objType, catalog, dbSchema, tableName, matchExactly)
+		query, err := scope.showTerseQuery(objType, catalog, dbSchema, tableName, matchExactly)
 		if err != nil {
 			return err
 		}
@@ -337,9 +357,17 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		tableType = []string{"TABLE"}
 	}
 
+	scope, empty, err := resolveGetObjectsScope(ctx, conn, depth, catalog, dbSchema, c.matchExactly)
+	if err != nil {
+		return nil, err
+	}
+	if empty {
+		return buildGetObjectsResult(c.Alloc)
+	}
+
 	// Optimized path: read SHOW TERSE results directly instead of through
 	// RESULT_SCAN SQL templates, reducing Snowflake round-trips from 3-4 to 1-2.
-	if reader, err = c.getObjectsDirectPath(ctx, depth, catalog, dbSchema, tableName, tableType, hasViews, hasTables); reader != nil || err != nil {
+	if reader, err = c.getObjectsDirectPath(ctx, depth, &scope, dbSchema, tableName, tableType, hasViews, hasTables); reader != nil || err != nil {
 		return
 	}
 
@@ -348,19 +376,19 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 	switch depth {
 	case adbc.ObjectDepthCatalogs:
 		query = queryGetObjectsTerseCatalogs
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &terseDbQueryID)
 	case adbc.ObjectDepthDBSchemas:
 		query = queryGetObjectsDbSchemas
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &showSchemaQueryID)
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &terseDbQueryID)
 	case adbc.ObjectDepthTables:
 		query = queryGetObjectsTables
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &showSchemaQueryID)
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &terseDbQueryID)
 
 		objType := objObjects
@@ -372,18 +400,18 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			}
 		}
 
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &tableQueryID)
 	default:
 		var suffix string
-		if catalog == nil || (!c.matchExactly && isWildcardStr(*catalog)) {
+		if scope.catalog == nil {
 			suffix = " IN ACCOUNT"
 		} else {
-			escapedCatalog := quoteIdentifier(*catalog)
-			if dbSchema == nil || (!c.matchExactly && isWildcardStr(*dbSchema)) {
+			escapedCatalog := quoteIdentifier(*scope.catalog)
+			if scope.dbSchema == nil {
 				suffix = " IN DATABASE " + escapedCatalog
 			} else {
-				escapedSchema := quoteIdentifier(*dbSchema)
+				escapedSchema := quoteIdentifier(*scope.dbSchema)
 				if tableName == nil || (!c.matchExactly && isWildcardStr(*tableName)) {
 					suffix = " IN SCHEMA " + escapedCatalog + "." + escapedSchema
 				} else {
@@ -426,7 +454,14 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			return err
 		})
 
-		columnsSuffix := showColumnsScope(catalog, dbSchema, tableName, c.matchExactly)
+		columnsCatalog, columnsSchema := catalog, dbSchema
+		if scope.catalog != nil {
+			columnsCatalog = scope.catalog
+		}
+		if scope.dbSchema != nil {
+			columnsSchema = scope.dbSchema
+		}
+		columnsSuffix := showColumnsScope(columnsCatalog, columnsSchema, tableName, c.matchExactly)
 		gQueryIDs.Go(func() (err error) {
 			query := "SHOW COLUMNS /* ADBC:getObjects */" + columnsSuffix
 			if hasEmptyLiteralFilter(c.matchExactly, catalog, dbSchema, tableName, columnName) {
@@ -436,9 +471,9 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			return err
 		})
 
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &terseDbQueryID)
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &showSchemaQueryID)
 
 		objType := objObjects
@@ -449,7 +484,7 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 				objType = objTables
 			}
 		}
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType,
+		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &tableQueryID)
 	}
 
