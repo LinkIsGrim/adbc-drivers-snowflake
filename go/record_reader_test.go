@@ -27,6 +27,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
@@ -951,5 +952,58 @@ func TestStreamRetryEnabled_RecoversFromShortReadMidFrameError(t *testing.T) {
 			assert.EqualValues(t, 4, recs[0].NumRows())
 			assert.Equal(t, 2, batch.call, "retry should have been invoked")
 		})
+	}
+}
+
+func TestDecimal128FromPlainString(t *testing.T) {
+	for _, tc := range []struct {
+		s           string
+		prec, scale int32
+	}{
+		{"0", 38, 0},
+		{"-0", 38, 0},
+		{"1", 38, 0},
+		{"-1", 38, 0},
+		{"000123", 38, 0},
+		{"999999999999999999", 38, 0},
+		{"-999999999999999999", 18, 0},
+		{"123.45", 10, 2},
+		{"12.3", 10, 2},
+		{"-12.30", 10, 2},
+		{"-0.5", 10, 2},
+		{".5", 10, 2},
+		{"1.", 10, 2},
+		{"99999999.99", 10, 2},
+		{"0.000001", 38, 6},
+		{"1", 38, 37},
+		{"-123456789012345678", 38, 20},
+	} {
+		want, err := decimal128.FromString(tc.s, tc.prec, tc.scale)
+		require.NoError(t, err, tc.s)
+		got, ok := decimal128FromPlainString(tc.s, tc.prec, tc.scale)
+		assert.True(t, ok, tc.s)
+		assert.Equal(t, want, got, tc.s)
+	}
+
+	// Inputs left to decimal128.FromString.
+	for _, tc := range []struct {
+		s           string
+		prec, scale int32
+	}{
+		{"", 38, 2},
+		{"-", 38, 2},
+		{".", 38, 2},
+		{"+1", 38, 2},
+		{" 1", 38, 2},
+		{"1e5", 38, 2},
+		{"1.2.3", 38, 2},
+		{"abc", 38, 2},
+		{"1234567890123456789", 38, 0},
+		{"1.234", 38, 2},
+		{"1000.00", 5, 2},
+		{"1", 38, 38},
+	} {
+		_, ok := decimal128FromPlainString(tc.s, tc.prec, tc.scale)
+		assert.False(t, ok, tc.s)
 	}
 }
