@@ -1140,3 +1140,7 @@ func BenchmarkDecodeJSONChunkRows(b *testing.B) {
 		}
 	}
 }
+
+func TestDecimal128FromPlainString(t *testing.T) {
+
+}
