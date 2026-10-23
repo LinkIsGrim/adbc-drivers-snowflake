@@ -1148,6 +1148,77 @@ func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals *[]string) ([
 	return row, nil
 }
 
+// jsonChunk is a downloaded JSON result chunk, or the error downloading it.
+type jsonChunk struct {
+	data     []byte
+	err      error
+	acquired bool
+}
+
+// jsonChunkPrefetcher downloads JSON result chunks ahead of the reader, up to
+// concurrency at a time, and hands them out in order. A download slot is freed
+// only when the reader takes the chunk, so at most concurrency chunks are held
+// in memory ahead of it.
+type jsonChunkPrefetcher struct {
+	cancel  context.CancelFunc
+	slots   *semaphore.Weighted
+	results []chan jsonChunk
+}
+
+func prefetchJSONChunks(ctx context.Context, batches []gosnowflake.ArrowStreamBatch, concurrency int) *jsonChunkPrefetcher {
+	ctx, cancel := context.WithCancel(ctx)
+	p := &jsonChunkPrefetcher{
+		cancel:  cancel,
+		slots:   semaphore.NewWeighted(int64(max(concurrency, 1))),
+		results: make([]chan jsonChunk, len(batches)),
+	}
+	for i := range p.results {
+		p.results[i] = make(chan jsonChunk, 1)
+	}
+	go func() {
+		for i, b := range batches {
+			if err := p.slots.Acquire(ctx, 1); err != nil {
+				for _, ch := range p.results[i:] {
+					ch <- jsonChunk{err: err}
+				}
+				return
+			}
+			go func() {
+				data, err := readJSONChunk(ctx, b)
+				p.results[i] <- jsonChunk{data: data, err: err, acquired: true}
+			}()
+		}
+	}()
+	return p
+}
+
+// next waits for chunk i. Chunks must be taken in order.
+func (p *jsonChunkPrefetcher) next(i int) ([]byte, error) {
+	c := <-p.results[i]
+	if c.acquired {
+		p.slots.Release(1)
+	}
+	return c.data, c.err
+}
+
+// close stops downloads that haven't finished.
+func (p *jsonChunkPrefetcher) close() { p.cancel() }
+
+func readJSONChunk(ctx context.Context, b gosnowflake.ArrowStreamBatch) ([]byte, error) {
+	rdr, err := b.GetStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetStream failed: %w", err)
+	}
+	data, err := io.ReadAll(rdr)
+	if closeErr := rdr.Close(); err == nil && closeErr != nil {
+		return nil, closeErr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ReadAll failed: %w", err)
+	}
+	return data, nil
+}
+
 // readJSONBatches handles the case where GetBatches() returned downloadable
 // chunks that contain JSON data instead of Arrow IPC. This happens with some
 // Snowflake stored procedures that return JSON-format results even when Arrow
@@ -1156,7 +1227,7 @@ func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals *[]string) ([
 //
 // batch0Data contains the already-read bytes for batches[0] (since its stream
 // was consumed during format detection). Remaining batches are read via GetStream.
-func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool) (array.RecordReader, error) {
+func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, prefetchConcurrency int, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool) (array.RecordReader, error) {
 	trace.SpanFromContext(ctx).AddEvent("readJSONBatches", trace.WithAttributes(
 		attribute.Int("batches", len(batches)),
 	))
@@ -1176,32 +1247,21 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	bldr := array.NewRecordBuilder(alloc, schema)
 	defer bldr.Release()
 
+	chunks := prefetchJSONChunks(ctx, batches[1:], prefetchConcurrency)
+	defer chunks.close()
+
 	var results []arrow.RecordBatch
 	var rawData [][]*string
 	var totalRowsRead int64
 	for batchIdx, b := range batches {
-		var data []byte
-		if batchIdx == 0 {
-			// Use the already-read data for batch[0]
-			data = batch0Data
-		} else {
-			rdr, err := b.GetStream(ctx)
-			if err != nil {
+		data := batch0Data
+		if batchIdx > 0 {
+			var err error
+			if data, err = chunks.next(batchIdx - 1); err != nil {
 				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d]: GetStream failed: %s", batchIdx, err.Error()),
+					Msg:  fmt.Sprintf("batch[%d]: %s", batchIdx, err.Error()),
 					Code: adbc.StatusInternal,
 				}
-			}
-
-			data, err = io.ReadAll(rdr)
-			rdrErr := rdr.Close()
-			if err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d]: ReadAll failed: %s", batchIdx, err.Error()),
-					Code: adbc.StatusInternal,
-				}
-			} else if rdrErr != nil {
-				return nil, rdrErr
 			}
 		}
 
@@ -1274,30 +1334,22 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		defer rec.Release()
 
+		chunks := prefetchJSONChunks(ctx, batches, prefetchConcurrency)
+		defer chunks.close()
+
 		results := []arrow.RecordBatch{rec}
 		totalRowsRead := rec.NumRows()
-		for _, b := range batches {
-			rdr, err := b.GetStream(ctx)
-			if err != nil {
-				return nil, adbc.Error{
-					Msg:  err.Error(),
-					Code: adbc.StatusInternal,
-				}
-			}
-
+		for i, b := range batches {
 			// the "JSON" data returned isn't valid JSON. Instead it is a list of
 			// comma-delimited JSON lists containing every value as a string, except
 			// for a JSON null to represent nulls. Thus we can't just use the existing
 			// JSON parsing code in Arrow.
-			data, err := io.ReadAll(rdr)
-			rdrErr := rdr.Close()
+			data, err := chunks.next(i)
 			if err != nil {
 				return nil, adbc.Error{
 					Msg:  err.Error(),
 					Code: adbc.StatusInternal,
 				}
-			} else if rdrErr != nil {
-				return nil, rdrErr
 			}
 
 			if cap(rawData) >= int(b.NumRows()) {
@@ -1379,7 +1431,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		trace.SpanFromContext(ctx).AddEvent("newRecordReader.jsonFormat", trace.WithAttributes(
 			attribute.Int("batch0Bytes", len(raw0Data)),
 		))
-		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, maxTimestampPrecision, useHighPrecision)
+		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, prefetchConcurrency, maxTimestampPrecision, useHighPrecision)
 	}
 
 	r := &countingReadCloser{inner: raw0}
