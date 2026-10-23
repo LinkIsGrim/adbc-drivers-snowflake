@@ -27,7 +27,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -964,6 +964,144 @@ func streamBatchToChannel(
 	)
 }
 
+// decodeJSONChunkRows decodes the first len(rows) rows of a JSON result chunk
+// into rows, reusing each row's backing array. A chunk is not a JSON document
+// by itself but the comma-separated elements of one (each element a JSON list
+// of strings or nulls), so it is decoded as if wrapped in [ and ], the same
+// way gosnowflake reads JSON chunks. Invalid UTF-8 is replaced with U+FFFD, as
+// encoding/json does.
+func decodeJSONChunkRows(data []byte, rows [][]*string) error {
+	dec := jsontext.NewDecoder(io.MultiReader(strings.NewReader("["), bytes.NewReader(data), strings.NewReader("]")),
+		jsontext.AllowInvalidUTF8(true))
+	if _, err := dec.ReadToken(); err != nil {
+		return fmt.Errorf("JSON decode failed: %w", err)
+	}
+	// Values are stored in one slice per chunk, sized from the first row, so
+	// each value needs no allocation of its own besides its string.
+	var vals []string
+	for i := range rows {
+		row, err := decodeJSONChunkRow(dec, rows[i][:0], &vals)
+		if err != nil {
+			return fmt.Errorf("row[%d]: JSON decode failed: %w", i, err)
+		}
+		rows[i] = row
+		if i == 0 {
+			vals = make([]string, 0, (len(rows)-1)*len(row))
+		}
+	}
+	// A truncated final row could otherwise be completed by the synthetic
+	// closing bracket.
+	if dec.InputOffset() > int64(len(data))+1 {
+		return fmt.Errorf("row[%d]: JSON decode failed: %w", len(rows)-1, io.ErrUnexpectedEOF)
+	}
+	return nil
+}
+
+// decodeJSONChunkRow reads one row, a JSON list of strings or nulls, and
+// appends its values to row, storing strings in vals.
+func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals *[]string) ([]*string, error) {
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return nil, err
+	}
+	if tok.Kind() != '[' {
+		return nil, fmt.Errorf("expected a list, got %v", tok.Kind())
+	}
+	for dec.PeekKind() != ']' {
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		switch tok.Kind() {
+		case 'n':
+			row = append(row, nil)
+		case '"':
+			if len(*vals) == cap(*vals) {
+				*vals = make([]string, 0, max(cap(*vals), 16))
+			}
+			*vals = append(*vals, tok.String())
+			row = append(row, &(*vals)[len(*vals)-1])
+		default:
+			return nil, fmt.Errorf("expected a string or null, got %v", tok.Kind())
+		}
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// jsonChunk is a downloaded JSON result chunk, or the error downloading it.
+type jsonChunk struct {
+	data     []byte
+	err      error
+	acquired bool
+}
+
+// jsonChunkPrefetcher downloads JSON result chunks ahead of the reader, up to
+// concurrency at a time, and hands them out in order. A download slot is freed
+// only when the reader takes the chunk, so at most concurrency chunks are held
+// in memory ahead of it.
+type jsonChunkPrefetcher struct {
+	cancel  context.CancelFunc
+	slots   *semaphore.Weighted
+	results []chan jsonChunk
+}
+
+func prefetchJSONChunks(ctx context.Context, batches []gosnowflake.ArrowStreamBatch, concurrency int) *jsonChunkPrefetcher {
+	ctx, cancel := context.WithCancel(ctx)
+	p := &jsonChunkPrefetcher{
+		cancel:  cancel,
+		slots:   semaphore.NewWeighted(int64(max(concurrency, 1))),
+		results: make([]chan jsonChunk, len(batches)),
+	}
+	for i := range p.results {
+		p.results[i] = make(chan jsonChunk, 1)
+	}
+	go func() {
+		for i, b := range batches {
+			if err := p.slots.Acquire(ctx, 1); err != nil {
+				for _, ch := range p.results[i:] {
+					ch <- jsonChunk{err: err}
+				}
+				return
+			}
+			go func() {
+				data, err := readJSONChunk(ctx, b)
+				p.results[i] <- jsonChunk{data: data, err: err, acquired: true}
+			}()
+		}
+	}()
+	return p
+}
+
+// next waits for chunk i. Chunks must be taken in order.
+func (p *jsonChunkPrefetcher) next(i int) ([]byte, error) {
+	c := <-p.results[i]
+	if c.acquired {
+		p.slots.Release(1)
+	}
+	return c.data, c.err
+}
+
+// close stops downloads that haven't finished.
+func (p *jsonChunkPrefetcher) close() { p.cancel() }
+
+func readJSONChunk(ctx context.Context, b gosnowflake.ArrowStreamBatch) ([]byte, error) {
+	rdr, err := b.GetStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetStream failed: %w", err)
+	}
+	data, err := io.ReadAll(rdr)
+	if closeErr := rdr.Close(); err == nil && closeErr != nil {
+		return nil, closeErr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ReadAll failed: %w", err)
+	}
+	return data, nil
+}
+
 // readJSONBatches handles the case where GetBatches() returned downloadable
 // chunks that contain JSON data instead of Arrow IPC. This happens with some
 // Snowflake stored procedures that return JSON-format results even when Arrow
@@ -972,7 +1110,7 @@ func streamBatchToChannel(
 //
 // batch0Data contains the already-read bytes for batches[0] (since its stream
 // was consumed during format detection). Remaining batches are read via GetStream.
-func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool) (array.RecordReader, error) {
+func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, prefetchConcurrency int, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool) (array.RecordReader, error) {
 	trace.SpanFromContext(ctx).AddEvent("readJSONBatches", trace.WithAttributes(
 		attribute.Int("batches", len(batches)),
 	))
@@ -992,32 +1130,21 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	bldr := array.NewRecordBuilder(alloc, schema)
 	defer bldr.Release()
 
+	chunks := prefetchJSONChunks(ctx, batches[1:], prefetchConcurrency)
+	defer chunks.close()
+
 	var results []arrow.RecordBatch
 	var rawData [][]*string
 	var totalRowsRead int64
 	for batchIdx, b := range batches {
-		var data []byte
-		if batchIdx == 0 {
-			// Use the already-read data for batch[0]
-			data = batch0Data
-		} else {
-			rdr, err := b.GetStream(ctx)
-			if err != nil {
+		data := batch0Data
+		if batchIdx > 0 {
+			var err error
+			if data, err = chunks.next(batchIdx - 1); err != nil {
 				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d]: GetStream failed: %s", batchIdx, err.Error()),
+					Msg:  fmt.Sprintf("batch[%d]: %s", batchIdx, err.Error()),
 					Code: adbc.StatusInternal,
 				}
-			}
-
-			data, err = io.ReadAll(rdr)
-			rdrErr := rdr.Close()
-			if err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d]: ReadAll failed: %s", batchIdx, err.Error()),
-					Code: adbc.StatusInternal,
-				}
-			} else if rdrErr != nil {
-				return nil, rdrErr
 			}
 		}
 
@@ -1034,22 +1161,10 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		bldr.Reserve(int(b.NumRows()))
 
-		offset, buf := int64(0), bytes.NewReader(data)
-		for i := range b.NumRows() {
-			dec := json.NewDecoder(buf)
-			if err = dec.Decode(&rawData[i]); err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d] row[%d]: JSON decode failed: %s", batchIdx, i, err.Error()),
-					Code: adbc.StatusInternal,
-				}
-			}
-
-			offset += dec.InputOffset() + 1
-			if _, err = buf.Seek(offset, 0); err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d] row[%d]: seek failed: %s", batchIdx, i, err.Error()),
-					Code: adbc.StatusInternal,
-				}
+		if err = decodeJSONChunkRows(data, rawData); err != nil {
+			return nil, adbc.Error{
+				Msg:  fmt.Sprintf("batch[%d] %s", batchIdx, err.Error()),
+				Code: adbc.StatusInternal,
 			}
 		}
 
@@ -1102,30 +1217,22 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		defer rec.Release()
 
+		chunks := prefetchJSONChunks(ctx, batches, prefetchConcurrency)
+		defer chunks.close()
+
 		results := []arrow.RecordBatch{rec}
 		totalRowsRead := rec.NumRows()
-		for _, b := range batches {
-			rdr, err := b.GetStream(ctx)
-			if err != nil {
-				return nil, adbc.Error{
-					Msg:  err.Error(),
-					Code: adbc.StatusInternal,
-				}
-			}
-
+		for i, b := range batches {
 			// the "JSON" data returned isn't valid JSON. Instead it is a list of
 			// comma-delimited JSON lists containing every value as a string, except
 			// for a JSON null to represent nulls. Thus we can't just use the existing
 			// JSON parsing code in Arrow.
-			data, err := io.ReadAll(rdr)
-			rdrErr := rdr.Close()
+			data, err := chunks.next(i)
 			if err != nil {
 				return nil, adbc.Error{
 					Msg:  err.Error(),
 					Code: adbc.StatusInternal,
 				}
-			} else if rdrErr != nil {
-				return nil, rdrErr
 			}
 
 			if cap(rawData) >= int(b.NumRows()) {
@@ -1135,29 +1242,10 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 			}
 			bldr.Reserve(int(b.NumRows()))
 
-			// we grab the entire JSON message and create a bytes reader
-			offset, buf := int64(0), bytes.NewReader(data)
-			for i := range b.NumRows() {
-				// we construct a decoder from the bytes.Reader to read the next JSON list
-				// of columns (one row) from the input
-				dec := json.NewDecoder(buf)
-				if err = dec.Decode(&rawData[i]); err != nil {
-					return nil, adbc.Error{
-						Msg:  err.Error(),
-						Code: adbc.StatusInternal,
-					}
-				}
-
-				// dec.InputOffset() now represents the index of the ',' so we skip the comma
-				offset += dec.InputOffset() + 1
-				// then seek the buffer to that spot. we have to seek based on the start
-				// because json.Decoder can read from the buffer more than is necessary to
-				// process the JSON data.
-				if _, err = buf.Seek(offset, 0); err != nil {
-					return nil, adbc.Error{
-						Msg:  err.Error(),
-						Code: adbc.StatusInternal,
-					}
+			if err = decodeJSONChunkRows(data, rawData); err != nil {
+				return nil, adbc.Error{
+					Msg:  err.Error(),
+					Code: adbc.StatusInternal,
 				}
 			}
 
@@ -1226,7 +1314,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		trace.SpanFromContext(ctx).AddEvent("newRecordReader.jsonFormat", trace.WithAttributes(
 			attribute.Int("batch0Bytes", len(raw0Data)),
 		))
-		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, maxTimestampPrecision, useHighPrecision)
+		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, prefetchConcurrency, maxTimestampPrecision, useHighPrecision)
 	}
 
 	r := &countingReadCloser{inner: raw0}
