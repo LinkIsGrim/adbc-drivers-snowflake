@@ -42,6 +42,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -824,6 +825,13 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 					}
 				}
 				fb.Append(b)
+			case *array.Decimal128Builder:
+				dt := fb.Type().(*arrow.Decimal128Type)
+				if n, ok := decimal128FromPlainString(*col, dt.Precision, dt.Scale); ok {
+					fb.Append(n)
+				} else if err := fb.AppendValueFromString(*col); err != nil {
+					return nil, err
+				}
 			default:
 				if err := fb.AppendValueFromString(*col); err != nil {
 					return nil, err
@@ -832,6 +840,49 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 		}
 	}
 	return bldr.NewRecordBatch(), nil
+}
+
+// decimal128FromPlainString parses s as [-]digits[.digits] with at most 18
+// significant digits and at most scale fractional digits, which covers most
+// NUMBER values in JSON results. It reports false for anything else, which
+// decimal128.FromString then handles; that goes through math/big and costs
+// about 40 times as much.
+func decimal128FromPlainString(s string, prec, scale int32) (decimal128.Num, bool) {
+	i, neg := 0, false
+	if len(s) > 0 && s[0] == '-' {
+		neg, i = true, 1
+	}
+	var v int64
+	digits, frac, sawDigit, sawDot := 0, int32(0), false, false
+	for ; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			if digits == 18 {
+				return decimal128.Num{}, false
+			}
+			if v != 0 || c != '0' {
+				digits++
+			}
+			v = v*10 + int64(c-'0')
+			sawDigit = true
+			if sawDot {
+				frac++
+			}
+		case c == '.' && !sawDot:
+			sawDot = true
+		default:
+			return decimal128.Num{}, false
+		}
+	}
+	// The result has digits+scale-frac significant digits; checking that
+	// before scaling keeps the 128-bit multiplication from overflowing.
+	if !sawDigit || frac > scale || digits+int(scale-frac) > int(prec) {
+		return decimal128.Num{}, false
+	}
+	if neg {
+		v = -v
+	}
+	return decimal128.FromI64(v).Mul(decimal128.GetScaleMultiplier(int(scale - frac))), true
 }
 
 type reader struct {
