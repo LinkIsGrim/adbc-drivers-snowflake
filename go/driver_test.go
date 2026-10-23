@@ -1900,6 +1900,42 @@ func (suite *SnowflakeTests) TestUntypedNullLiteral() {
 		"SELECT NULL: expected utf8, got %s", rdr.Schema().Field(0).Type)
 }
 
+// A JSON result large enough to arrive in several chunks comes back complete
+// and in order.
+func (suite *SnowflakeTests) TestQueryJSONMultipleChunks() {
+	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, suite.Quirks.DatabaseOptions())
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
+	cnxn, err := db.Open(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), cnxn, suite.ctx)
+
+	stmt, err := cnxn.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), stmt, suite.ctx)
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, "ALTER SESSION SET GO_QUERY_RESULT_FORMAT = 'JSON'"))
+	_, err = stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	const numRows = 300_000
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, fmt.Sprintf(
+		"SELECT seq4() AS i, randstr(40, random(42)) AS s FROM TABLE(GENERATOR(ROWCOUNT => %d)) ORDER BY i", numRows)))
+	rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	var next int64
+	for rdr.Next() {
+		col := rdr.RecordBatch().Column(0)
+		for i := range col.Len() {
+			suite.Require().Equal(fmt.Sprint(next), col.ValueStr(i), "row %d", next)
+			next++
+		}
+	}
+	suite.Require().NoError(rdr.Err())
+	suite.EqualValues(numRows, next)
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = "microseconds"
@@ -2645,6 +2681,52 @@ func (suite *SnowflakeTests) TestIngestEmptyChunk() {
 	suite.EqualValues(int64(3), n)
 }
 
+// Many small files with concurrent uploads and COPYs often leave files for
+// the final COPY to load after the background COPYs finish.
+func (suite *SnowflakeTests) TestIngestManySmallFiles() {
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, "bulk_ingest_many_files"))
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{
+			Name: "col_int64", Type: arrow.PrimitiveTypes.Int64,
+			Nullable: true,
+		},
+		{
+			Name: "col_string", Type: arrow.BinaryTypes.String,
+			Nullable: true,
+		},
+	}, nil)
+
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	const numBatches, batchSize = 300, 200
+	recs := make([]arrow.RecordBatch, numBatches)
+	for b := range numBatches {
+		for i := range batchSize {
+			bldr.Field(0).(*array.Int64Builder).Append(int64(b*batchSize + i))
+			bldr.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("row-%d-%d", b, i))
+		}
+		recs[b] = bldr.NewRecordBatch()
+		defer recs[b].Release()
+	}
+
+	rdr, err := array.NewRecordReader(sc, recs)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.Require().NoError(suite.stmt.BindStream(suite.ctx, rdr))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, "bulk_ingest_many_files"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestTargetFileSize, "1024"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestWriterConcurrency, "8"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestUploadConcurrency, "16"))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestCopyConcurrency, "8"))
+
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+	suite.EqualValues(numBatches*batchSize, n)
+}
+
 func TestIngestCancelContext(t *testing.T) {
 	withQuirks(t, func(q *SnowflakeQuirks) {
 		ctx := context.Background()
@@ -2820,6 +2902,36 @@ func (suite *SnowflakeTests) TestChangeDatabaseAndGetObjects() {
 
 	_, err2 := suite.cnxn.GetObjects(suite.ctx, adbc.ObjectDepthAll, &newCatalog, &cfg.Schema, &getObjectsTable, nil, nil)
 	suite.NoError(err2)
+}
+
+func (suite *SnowflakeTests) TestCurrentNamespaceCanceledContext() {
+	cnxnopt, ok := suite.cnxn.(adbc.GetSetOptionsWithContext)
+	suite.Require().True(ok)
+
+	ctx, cancel := context.WithCancel(suite.ctx)
+	cancel()
+
+	_, err := cnxnopt.GetOption(ctx, adbc.OptionKeyCurrentCatalog)
+	suite.Error(err)
+	_, err = cnxnopt.GetOption(ctx, adbc.OptionKeyCurrentDbSchema)
+	suite.Error(err)
+}
+
+// Commit and Rollback finish the transaction even if the caller's context is
+// canceled.
+func (suite *SnowflakeTests) TestCommitRollbackCanceledContext() {
+	cnxnopt, ok := suite.cnxn.(adbc.GetSetOptionsWithContext)
+	suite.Require().True(ok)
+	suite.Require().NoError(cnxnopt.SetOption(suite.ctx, adbc.OptionKeyAutoCommit, adbc.OptionValueDisabled))
+	defer func() {
+		suite.NoError(cnxnopt.SetOption(suite.ctx, adbc.OptionKeyAutoCommit, adbc.OptionValueEnabled))
+	}()
+
+	ctx, cancel := context.WithCancel(suite.ctx)
+	cancel()
+
+	suite.NoError(suite.cnxn.Commit(ctx))
+	suite.NoError(suite.cnxn.Rollback(ctx))
 }
 
 func (suite *SnowflakeTests) TestGetSetClientConfigFile() {

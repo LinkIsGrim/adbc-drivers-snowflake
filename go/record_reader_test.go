@@ -27,6 +27,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
@@ -952,4 +953,202 @@ func TestStreamRetryEnabled_RecoversFromShortReadMidFrameError(t *testing.T) {
 			assert.Equal(t, 2, batch.call, "retry should have been invoked")
 		})
 	}
+}
+
+// POINT(1 2) with SRID 4326, as EWKB and as the expected plain WKB.
+var (
+	ewkbPointLE = []byte{
+		0x01, 0x01, 0x00, 0x00, 0x20, // little endian, Point | SRID flag
+		0xE6, 0x10, 0x00, 0x00, // SRID 4326
+		0, 0, 0, 0, 0, 0, 0xF0, 0x3F, // x = 1
+		0, 0, 0, 0, 0, 0, 0x00, 0x40, // y = 2
+	}
+	wkbPointLE = []byte{
+		0x01, 0x01, 0x00, 0x00, 0x00,
+		0, 0, 0, 0, 0, 0, 0xF0, 0x3F,
+		0, 0, 0, 0, 0, 0, 0x00, 0x40,
+	}
+	ewkbPointBE = []byte{
+		0x00, 0x20, 0x00, 0x00, 0x01, // big endian, SRID flag | Point
+		0x00, 0x00, 0x10, 0xE6,
+		0x3F, 0xF0, 0, 0, 0, 0, 0, 0,
+		0x40, 0x00, 0, 0, 0, 0, 0, 0,
+	}
+	wkbPointBE = []byte{
+		0x00, 0x00, 0x00, 0x00, 0x01,
+		0x3F, 0xF0, 0, 0, 0, 0, 0, 0,
+		0x40, 0x00, 0, 0, 0, 0, 0, 0,
+	}
+)
+
+func TestAppendStrippedEWKBSRID(t *testing.T) {
+	tests := []struct {
+		name    string
+		in, out []byte
+	}{
+		{"little endian with SRID", ewkbPointLE, wkbPointLE},
+		{"big endian with SRID", ewkbPointBE, wkbPointBE},
+		{"plain WKB is unchanged", wkbPointLE, wkbPointLE},
+		{"short input is unchanged", []byte{0x01, 0x02}, []byte{0x01, 0x02}},
+		{"unknown byte order is unchanged", append([]byte{0x07}, ewkbPointLE[1:]...), append([]byte{0x07}, ewkbPointLE[1:]...)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.out, appendStrippedEWKBSRID(nil, tt.in))
+			// Appends after existing content rather than overwriting it.
+			assert.Equal(t, append([]byte("x"), tt.out...), appendStrippedEWKBSRID([]byte("x"), tt.in))
+		})
+	}
+}
+
+func TestStripEWKBSRIDColumnUsesContextAllocator(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+
+	bldr := array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+	bldr.Append(ewkbPointLE)
+	bldr.AppendNull()
+	bldr.Append(ewkbPointBE)
+	bldr.Append(wkbPointLE)
+	in := bldr.NewArray()
+	bldr.Release()
+	defer in.Release()
+	inBytes := mem.CurrentAlloc()
+
+	out, err := stripEWKBSRIDColumn(compute.WithAllocator(context.Background(), mem), in)
+	require.NoError(t, err)
+	assert.Greater(t, mem.CurrentAlloc(), inBytes, "output was not allocated from the context allocator")
+
+	got := out.(*array.Binary)
+	require.Equal(t, 4, got.Len())
+	assert.Equal(t, wkbPointLE, got.Value(0))
+	assert.True(t, got.IsNull(1))
+	assert.Equal(t, wkbPointBE, got.Value(2))
+	assert.Equal(t, wkbPointLE, got.Value(3))
+	out.Release()
+}
+
+func BenchmarkStripEWKBSRIDColumn(b *testing.B) {
+	bldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	for range 1 << 16 {
+		bldr.Append(ewkbPointLE)
+	}
+	in := bldr.NewArray()
+	bldr.Release()
+	defer in.Release()
+
+	ctx := compute.WithAllocator(context.Background(), memory.DefaultAllocator)
+	b.ReportAllocs()
+	for b.Loop() {
+		out, err := stripEWKBSRIDColumn(ctx, in)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out.Release()
+	}
+}
+
+// jsonRow builds an expected decoded row; "<null>" stands for a JSON null.
+func jsonRow(vals ...string) []*string {
+	row := make([]*string, len(vals))
+	for i, v := range vals {
+		if v != "<null>" {
+			row[i] = &v
+		}
+	}
+	return row
+}
+
+func TestDecodeJSONChunkRows(t *testing.T) {
+	chunks := map[string]struct {
+		data string
+		want [][]*string
+	}{
+		"single row":               {`["a","b"]`, [][]*string{jsonRow("a", "b")}},
+		"nulls":                    {`[null,"1"],["2",null]`, [][]*string{jsonRow("<null>", "1"), jsonRow("2", "<null>")}},
+		"escapes and unicode":      {`["a\"b\\c","é\n\u00e9"],["[,]","{\"k\":1}"]`, [][]*string{jsonRow(`a"b\c`, "é\né"), jsonRow("[,]", `{"k":1}`)}},
+		"invalid UTF-8":            {"[\"a\xffb\",\"\\ud800\"]", [][]*string{jsonRow("a\uFFFDb", "\uFFFD")}},
+		"whitespace between rows":  {"[\"1\"],\n[\"2\"],\t [\"3\"]", [][]*string{jsonRow("1"), jsonRow("2"), jsonRow("3")}},
+		"empty row":                {`[],["x"]`, [][]*string{jsonRow(), jsonRow("x")}},
+		"rows of different widths": {`["1"],["2","3","4"],["5","6"]`, [][]*string{jsonRow("1"), jsonRow("2", "3", "4"), jsonRow("5", "6")}},
+		"fewer rows than in chunk": {`["1"],["2"],["3"]`, [][]*string{jsonRow("1"), jsonRow("2")}},
+	}
+	for name, tc := range chunks {
+		t.Run(name, func(t *testing.T) {
+			got := make([][]*string, len(tc.want))
+			require.NoError(t, decodeJSONChunkRows([]byte(tc.data), got))
+			require.Len(t, got, len(tc.want))
+			for i := range tc.want {
+				assert.Equal(t, len(tc.want[i]), len(got[i]), "row %d", i)
+				for j := range min(len(tc.want[i]), len(got[i])) {
+					assert.Equal(t, tc.want[i][j], got[i][j], "row %d col %d", i, j)
+				}
+			}
+		})
+	}
+}
+
+func TestDecodeJSONChunkRowsReusesRows(t *testing.T) {
+	rows := make([][]*string, 2)
+	require.NoError(t, decodeJSONChunkRows([]byte(`["a","b","c"],["d"]`), rows))
+	require.NoError(t, decodeJSONChunkRows([]byte(`["x"],[null,"y"]`), rows))
+	assert.Equal(t, [][]*string{jsonRow("x"), jsonRow("<null>", "y")}, rows)
+}
+
+func TestDecodeJSONChunkRowsErrors(t *testing.T) {
+	for name, data := range map[string]string{
+		"too few rows":         `["1"]`,
+		"not a list":           `{"a":"1"}`,
+		"number value":         `["1"],[2]`,
+		"truncated":            `["1"],["2"`,
+		"truncated mid-string": `["1"],["2`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := decodeJSONChunkRows([]byte(data), make([][]*string, 2))
+			assert.ErrorContains(t, err, "JSON decode failed")
+		})
+	}
+}
+
+func BenchmarkDecodeJSONChunkRows(b *testing.B) {
+	const rows, cols = 50_000, 8
+	var sb strings.Builder
+	for r := range rows {
+		if r > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('[')
+		for c := range cols {
+			if c > 0 {
+				sb.WriteByte(',')
+			}
+			if (r+c)%7 == 0 {
+				sb.WriteString("null")
+			} else {
+				fmt.Fprintf(&sb, "%q", fmt.Sprintf("row %d col %d", r, c))
+			}
+		}
+		sb.WriteByte(']')
+	}
+	data := []byte(sb.String())
+	dst := make([][]*string, rows)
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := decodeJSONChunkRows(data, dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestDecimal128FromPlainString(t *testing.T) {
+
+}
+
+func TestExtractTimestamp(t *testing.T) {
+
+}
+
+func TestJSONDataToArrowTimestampTZ(t *testing.T) {
+
 }
