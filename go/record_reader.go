@@ -410,141 +410,17 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		case "TIMESTAMP_NTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
-			scaleDivisor := int64(math.Pow10(int(srcMeta.Scale)))
-			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				pool := compute.GetAllocator(ctx)
-				tb := array.NewTimestampBuilder(pool, dt)
-				defer tb.Release()
-
-				if a.DataType().ID() != arrow.STRUCT {
-					values := a.(*array.Int64).Int64Values()
-					for i, value := range values {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						t := scaledTimestampToTime(value, scaleDivisor, fractionMultiplier)
-						v, err := getArrowTimestampFromTime(t, dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-					return tb.NewArray(), nil
-				}
-
-				structData := a.(*array.Struct)
-				epoch := structData.Field(0).(*array.Int64).Int64Values()
-				fraction := structData.Field(1).(*array.Int32).Int32Values()
-				for i := range a.Len() {
-					if a.IsNull(i) {
-						tb.AppendNull()
-						continue
-					}
-
-					v, err := getArrowTimestampFromTime(time.Unix(epoch[i], int64(fraction[i])), dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-					if err != nil {
-						return nil, err
-					}
-					tb.Append(v)
-				}
-				return tb.NewArray(), nil
-			}
+			transformers[i] = timestampTransformer(false, dt, srcMeta.Scale, originalArrowUnit, maxTimestampPrecision, nil)
 		case "TIMESTAMP_LTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision), TimeZone: loc.String()}
 			f.Type = dt
-			scaleDivisor := int64(math.Pow10(int(srcMeta.Scale)))
-			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				pool := compute.GetAllocator(ctx)
-				tb := array.NewTimestampBuilder(pool, dt)
-				defer tb.Release()
-
-				if a.DataType().ID() == arrow.STRUCT {
-					structData := a.(*array.Struct)
-					epoch := structData.Field(0).(*array.Int64).Int64Values()
-					fraction := structData.Field(1).(*array.Int32).Int32Values()
-					for i := range a.Len() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						v, err := getArrowTimestampFromTime(time.Unix(epoch[i], int64(fraction[i])), dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				} else {
-					for i, value := range a.(*array.Int64).Int64Values() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						t := scaledTimestampToTime(value, scaleDivisor, fractionMultiplier).In(loc)
-						v, err := getArrowTimestampFromTime(t, dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				}
-				return tb.NewArray(), nil
-			}
+			transformers[i] = timestampTransformer(false, dt, srcMeta.Scale, originalArrowUnit, maxTimestampPrecision, loc)
 		case "TIMESTAMP_TZ":
 			// we convert each value to UTC since we have timezone information
 			// with the data that lets us do so.
 			dt := &arrow.TimestampType{TimeZone: "UTC", Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
-			scaleDivisor := int64(math.Pow10(int(srcMeta.Scale)))
-			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				pool := compute.GetAllocator(ctx)
-				tb := array.NewTimestampBuilder(pool, dt)
-				defer tb.Release()
-
-				structData := a.(*array.Struct)
-				if structData.NumField() == 2 {
-					epoch := structData.Field(0).(*array.Int64).Int64Values()
-					tzoffset := structData.Field(1).(*array.Int32).Int32Values()
-					for i := range a.Len() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						loc := gosnowflake.Location(int(tzoffset[i]) - 1440)
-						t := scaledTimestampToTime(epoch[i], scaleDivisor, fractionMultiplier).In(loc)
-						v, err := getArrowTimestampFromTime(t, dt.Unit, originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				} else {
-					epoch := structData.Field(0).(*array.Int64).Int64Values()
-					fraction := structData.Field(1).(*array.Int32).Int32Values()
-					tzoffset := structData.Field(2).(*array.Int32).Int32Values()
-					for i := range a.Len() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						loc := gosnowflake.Location(int(tzoffset[i]) - 1440)
-						v, err := getArrowTimestampFromTime(time.Unix(epoch[i], int64(fraction[i])).In(loc), dt.Unit, originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				}
-				return tb.NewArray(), nil
-			}
+			transformers[i] = timestampTransformer(true, dt, srcMeta.Scale, originalArrowUnit, maxTimestampPrecision, nil)
 		default:
 			transformers[i] = identCol
 		}
