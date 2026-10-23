@@ -722,17 +722,18 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 }
 
 func extractTimestamp(src *string) (sec, nsec int64, err error) {
-	s, ms, hasFraction := strings.Cut(*src, ".")
+	s, frac, _ := strings.Cut(*src, ".")
 	sec, err = strconv.ParseInt(s, 10, 64)
-	if err != nil {
+	if err != nil || frac == "" {
 		return
 	}
-
-	if !hasFraction {
-		return
+	if len(frac) > 9 {
+		return 0, 0, fmt.Errorf("invalid timestamp %q: more than 9 fractional digits", *src)
 	}
-
-	nsec, err = strconv.ParseInt(ms+strings.Repeat("0", 9-len(ms)), 10, 64)
+	nsec, err = strconv.ParseInt(frac, 10, 64)
+	for range 9 - len(frac) {
+		nsec *= 10
+	}
 	return
 }
 
@@ -767,8 +768,8 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 
 				if snowflakeType == "timestamp_tz" {
 					// "timestamp_tz" should be value + offset separated by space
-					tm := strings.Split(*col, " ")
-					if len(tm) != 2 {
+					value, offsetStr, ok := strings.Cut(*col, " ")
+					if !ok || strings.Contains(offsetStr, " ") {
 						return nil, adbc.Error{
 							Msg:        "invalid TIMESTAMP_TZ data. value doesn't consist of two numeric values separated by a space: " + *col,
 							SqlState:   [5]byte{'2', '2', '0', '0', '7'},
@@ -777,14 +778,14 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 						}
 					}
 
-					sec, nsec, err := extractTimestamp(&tm[0])
+					sec, nsec, err := extractTimestamp(&value)
 					if err != nil {
 						return nil, err
 					}
-					offset, err := strconv.ParseInt(tm[1], 10, 64)
+					offset, err := strconv.ParseInt(offsetStr, 10, 64)
 					if err != nil {
 						return nil, adbc.Error{
-							Msg:        "invalid TIMESTAMP_TZ data. offset value is not an integer: " + tm[1],
+							Msg:        "invalid TIMESTAMP_TZ data. offset value is not an integer: " + offsetStr,
 							SqlState:   [5]byte{'2', '2', '0', '0', '7'},
 							VendorCode: 268000,
 							Code:       adbc.StatusInvalidData,

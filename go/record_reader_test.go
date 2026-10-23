@@ -953,3 +953,51 @@ func TestStreamRetryEnabled_RecoversFromShortReadMidFrameError(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		in        string
+		sec, nsec int64
+	}{
+		{"1700000000", 1700000000, 0},
+		{"1700000000.5", 1700000000, 500_000_000},
+		{"1700000000.000001", 1700000000, 1_000},
+		{"1700000000.123456789", 1700000000, 123_456_789},
+		{"-1.5", -1, 500_000_000},
+		{"1.", 1, 0},
+	} {
+		sec, nsec, err := extractTimestamp(&tc.in)
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.sec, sec, tc.in)
+		assert.Equal(t, tc.nsec, nsec, tc.in)
+	}
+	for _, in := range []string{"", "x", "1.x", "1.1234567890"} {
+		_, _, err := extractTimestamp(&in)
+		assert.Error(t, err, in)
+	}
+}
+
+func TestJSONDataToArrowTimestampTZ(t *testing.T) {
+	sc := arrow.NewSchema([]arrow.Field{{
+		Name:     "tz",
+		Type:     &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"},
+		Nullable: true,
+		Metadata: arrow.NewMetadata([]string{MetadataKeySnowflakeType}, []string{"timestamp_tz"}),
+	}}, nil)
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, sc)
+	defer bldr.Release()
+
+	// The offset is minutes from UTC plus 1440.
+	val := "1700000000.000001 1500"
+	rec, err := jsonDataToArrow(context.Background(), bldr, [][]*string{{&val}, {nil}}, Nanoseconds)
+	require.NoError(t, err)
+	defer rec.Release()
+	col := rec.Column(0).(*array.Timestamp)
+	assert.Equal(t, arrow.Timestamp(1700000000_000001), col.Value(0))
+	assert.True(t, col.IsNull(1))
+
+	for _, bad := range []string{"1700000000", "1700000000 1500 1", "1700000000 x"} {
+		_, err := jsonDataToArrow(context.Background(), bldr, [][]*string{{&bad}}, Nanoseconds)
+		assert.ErrorContains(t, err, "invalid TIMESTAMP_TZ data", bad)
+	}
+}
