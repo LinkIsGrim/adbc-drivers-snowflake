@@ -552,7 +552,7 @@ func (c *connectionImpl) PrepareDriverInfo(ctx context.Context, infoCodes []adbc
 		return err
 	}
 
-	version, err := c.getStringQuery("SELECT CURRENT_VERSION()")
+	version, err := c.getStringQuery(ctx, "SELECT CURRENT_VERSION()")
 	if err != nil {
 		return err
 	}
@@ -566,12 +566,12 @@ func (*connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
 
 // GetCurrentCatalog implements driverbase.CurrentNamespacer.
 func (c *connectionImpl) GetCurrentCatalog(ctx context.Context) (string, error) {
-	return c.getStringQuery("SELECT CURRENT_DATABASE()")
+	return c.getStringQuery(ctx, "SELECT CURRENT_DATABASE()")
 }
 
 // GetCurrentDbSchema implements driverbase.CurrentNamespacer.
 func (c *connectionImpl) GetCurrentDbSchema(ctx context.Context) (string, error) {
-	return c.getStringQuery("SELECT CURRENT_SCHEMA()")
+	return c.getStringQuery(ctx, "SELECT CURRENT_SCHEMA()")
 }
 
 // SetCurrentCatalog implements driverbase.CurrentNamespacer.
@@ -839,8 +839,8 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, useH
 	return
 }
 
-func (c *connectionImpl) getStringQuery(query string) (value string, err error) {
-	result, err := c.cn.QueryContext(context.Background(), query, nil)
+func (c *connectionImpl) getStringQuery(ctx context.Context, query string) (value string, err error) {
+	result, err := c.cn.QueryContext(ctx, query, nil)
 	if err != nil {
 		return "", errToAdbcErr(adbc.StatusInternal, err)
 	}
@@ -945,13 +945,16 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 // only be used if autocommit is disabled.
 //
 // Behavior is undefined if this is mixed with SQL transaction statements.
-func (c *connectionImpl) Commit(_ context.Context) error {
-	_, err := c.cn.ExecContext(context.Background(), "COMMIT", nil)
+func (c *connectionImpl) Commit(ctx context.Context) error {
+	// Finish the transaction even if the caller has given up on it, but keep
+	// the context's values (tracing, gosnowflake query options).
+	ctx = context.WithoutCancel(ctx)
+	_, err := c.cn.ExecContext(ctx, "COMMIT", nil)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusInternal, err)
 	}
 
-	_, err = c.cn.ExecContext(context.Background(), "BEGIN", nil)
+	_, err = c.cn.ExecContext(ctx, "BEGIN", nil)
 	return errToAdbcErr(adbc.StatusInternal, err)
 }
 
@@ -959,13 +962,16 @@ func (c *connectionImpl) Commit(_ context.Context) error {
 // is disabled.
 //
 // Behavior is undefined if this is mixed with SQL transaction statements.
-func (c *connectionImpl) Rollback(_ context.Context) error {
-	_, err := c.cn.ExecContext(context.Background(), "ROLLBACK", nil)
+func (c *connectionImpl) Rollback(ctx context.Context) error {
+	// Finish the transaction even if the caller has given up on it, but keep
+	// the context's values (tracing, gosnowflake query options).
+	ctx = context.WithoutCancel(ctx)
+	_, err := c.cn.ExecContext(ctx, "ROLLBACK", nil)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusInternal, err)
 	}
 
-	_, err = c.cn.ExecContext(context.Background(), "BEGIN", nil)
+	_, err = c.cn.ExecContext(ctx, "BEGIN", nil)
 	return errToAdbcErr(adbc.StatusInternal, err)
 }
 
