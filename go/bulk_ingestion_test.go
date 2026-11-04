@@ -25,6 +25,7 @@ package snowflake
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"io"
 	"testing"
@@ -244,4 +245,24 @@ func makeRec(mem memory.Allocator, nCols, nRows int) arrow.RecordBatch {
 
 	schema := arrow.NewSchema(fields, nil)
 	return array.NewRecordBatch(schema, cols, int64(nRows))
+}
+
+func TestCopyResultCount(t *testing.T) {
+	for _, tc := range []struct {
+		in   driver.Value
+		want int64
+	}{
+		{nil, 0},
+		{"0", 0},
+		{"12345", 12345},
+		{int64(7), 7},
+	} {
+		got, err := copyResultCount(tc.in)
+		require.NoError(t, err, "%#v", tc.in)
+		assert.Equal(t, tc.want, got, "%#v", tc.in)
+	}
+	for _, in := range []driver.Value{"", "1.5", "many", 1.5, true} {
+		_, err := copyResultCount(in)
+		assert.Error(t, err, "%#v", in)
+	}
 }
