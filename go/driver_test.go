@@ -2693,6 +2693,78 @@ func (suite *SnowflakeTests) TestIngestManySmallFiles() {
 	suite.EqualValues(numBatches*batchSize, n)
 }
 
+// Rows another session writes to the target table during ingestion are not
+// counted as rows affected.
+func (suite *SnowflakeTests) TestIngestRowsAffectedWithConcurrentWriter() {
+	const table = "bulk_ingest_concurrent_writer"
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, table))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TABLE "+quoteIdentifier(table)+" (col_int64 BIGINT, col_string VARCHAR)"))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "col_int64", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "col_string", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	const numBatches, batchSize = 300, 200
+	recs := make([]arrow.RecordBatch, numBatches)
+	for b := range numBatches {
+		for i := range batchSize {
+			bldr.Field(0).(*array.Int64Builder).Append(int64(b*batchSize + i))
+			bldr.Field(1).(*array.StringBuilder).Append("ingested")
+		}
+		recs[b] = bldr.NewRecordBatch()
+		defer recs[b].Release()
+	}
+	rdr, err := array.NewRecordReader(sc, recs)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	writer, err := suite.db.Open(suite.ctx)
+	suite.Require().NoError(err)
+	defer func() { suite.NoError(writer.Close(suite.ctx)) }()
+	writerStmt, err := writer.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer func() { suite.NoError(writerStmt.Close(suite.ctx)) }()
+	suite.Require().NoError(writerStmt.SetSqlQuery(suite.ctx, "INSERT INTO "+quoteIdentifier(table)+" SELECT -1, 'other' FROM TABLE(GENERATOR(ROWCOUNT => 100))"))
+
+	// Keep inserting from the other session until ingestion returns.
+	ingestDone := make(chan struct{})
+	writerDone := make(chan error, 1)
+	var insertedDuringIngest int64
+	go func() {
+		for {
+			n, err := writerStmt.ExecuteUpdate(suite.ctx)
+			if err != nil {
+				writerDone <- err
+				return
+			}
+			select {
+			case <-ingestDone:
+				writerDone <- nil
+				return
+			default:
+				insertedDuringIngest += n
+			}
+		}
+	}()
+
+	suite.Require().NoError(suite.stmt.BindStream(suite.ctx, rdr))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, table))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestMode, adbc.OptionValueIngestModeAppend))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestTargetFileSize, "1024"))
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	close(ingestDone)
+	suite.Require().NoError(<-writerDone)
+	suite.Require().NoError(err)
+
+	suite.Require().Positive(insertedDuringIngest, "the other session inserted no rows during ingestion")
+	suite.EqualValues(numBatches*batchSize, n)
+}
+
 func TestIngestCancelContext(t *testing.T) {
 	withQuirks(t, func(q *SnowflakeQuirks) {
 		ctx := context.Background()
