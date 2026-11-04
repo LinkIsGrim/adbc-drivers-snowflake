@@ -357,22 +357,77 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		tableType = []string{"TABLE"}
 	}
 
-	scope, empty, err := resolveGetObjectsScope(ctx, conn, depth, catalog, dbSchema, c.matchExactly)
-	if err != nil {
-		return nil, err
-	}
-	if empty {
-		return buildGetObjectsResult(c.Alloc)
-	}
+	var scope getObjectsScope
+	if depth != adbc.ObjectDepthCatalogs {
+		if depth == adbc.ObjectDepthTables && len(tableType) > 0 && !hasViews && !hasTables {
+			// tableType was specified but doesn't include TABLE or VIEW:
+			// return an empty result without any round-trips.
+			return buildGetObjectsResult(c.Alloc)
+		}
 
-	// Optimized path: read SHOW TERSE results directly instead of through
-	// RESULT_SCAN SQL templates, reducing Snowflake round-trips from 3-4 to 1-2.
-	if reader, err = c.getObjectsDirectPath(ctx, depth, &scope, dbSchema, tableName, tableType, hasViews, hasTables); reader != nil || err != nil {
-		return
+		// Resolve the catalog pattern to databases, then query each one
+		// (see get_objects_per_db.go).
+		var perCatalog func(ctx context.Context, catalog string) (driverbase.GetObjectsInfo, error)
+		switch depth {
+		case adbc.ObjectDepthDBSchemas:
+			perCatalog = func(ctx context.Context, catalog string) (driverbase.GetObjectsInfo, error) {
+				return c.getObjectsDBSchemasIn(ctx, catalog, dbSchema)
+			}
+		case adbc.ObjectDepthTables:
+			objType := showObjType(tableType)
+			perCatalog = func(ctx context.Context, catalog string) (driverbase.GetObjectsInfo, error) {
+				return c.getObjectsTablesIn(ctx, catalog, dbSchema, tableName, objType)
+			}
+		default:
+			perCatalog = func(ctx context.Context, catalog string) (driverbase.GetObjectsInfo, error) {
+				return c.getObjectsColumnsIn(ctx, catalog, nil, dbSchema, tableName, columnName)
+			}
+		}
+
+		// A literal catalog name is usually the database's exact name, so
+		// query that database while SHOW TERSE DATABASES confirms it.
+		guess := literalScope(catalog, nil, c.matchExactly).catalog
+		var guessed chan catalogResult
+		if guess != nil && *guess != "" {
+			guessCtx, cancelGuess := context.WithCancel(ctx)
+			defer cancelGuess()
+			guessed = make(chan catalogResult, 1)
+			go func() {
+				info, err := perCatalog(guessCtx, *guess)
+				guessed <- catalogResult{info, err}
+			}()
+		}
+
+		catalogs, dbQueryID, err := c.showTerseCatalogs(ctx, catalog)
+		if err != nil {
+			return nil, err
+		}
+		var infos []driverbase.GetObjectsInfo
+		switch {
+		case len(catalogs) == 0:
+			return buildGetObjectsResult(c.Alloc)
+		case len(catalogs) == 1 && guess != nil && catalogs[0] == *guess:
+			r := <-guessed
+			infos, err = []driverbase.GetObjectsInfo{r.info}, r.err
+		case len(catalogs) <= getObjectsMaxScopedCatalogs:
+			infos, err = forEachCatalog(ctx, catalogs, perCatalog)
+		case depth == adbc.ObjectDepthColumns:
+			infos, err = c.getObjectsColumns(ctx, catalogs, dbSchema, tableName, columnName)
+		default:
+			// Too many databases to query one by one: use account-wide
+			// SHOWs, reusing the one that listed the databases.
+			scope.dbQueryID = dbQueryID
+		}
+		if err != nil {
+			return nil, err
+		}
+		if infos != nil {
+			return buildGetObjectsResult(c.Alloc, infos...)
+		}
 	}
 
 	gQueryIDs, gQueryIDsCtx := errgroup.WithContext(ctx)
-	query := queryGetObjectsAll
+	var query string
 	switch depth {
 	case adbc.ObjectDepthCatalogs:
 		query = queryGetObjectsTerseCatalogs
@@ -400,90 +455,6 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 			}
 		}
 
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType, &scope,
-			catalog, dbSchema, tableName, c.matchExactly, &tableQueryID)
-	default:
-		var suffix string
-		if scope.catalog == nil {
-			suffix = " IN ACCOUNT"
-		} else {
-			escapedCatalog := quoteIdentifier(*scope.catalog)
-			if scope.dbSchema == nil {
-				suffix = " IN DATABASE " + escapedCatalog
-			} else {
-				escapedSchema := quoteIdentifier(*scope.dbSchema)
-				if tableName == nil || (!c.matchExactly && isWildcardStr(*tableName)) {
-					suffix = " IN SCHEMA " + escapedCatalog + "." + escapedSchema
-				} else {
-					escapedTable := quoteIdentifier(*tableName)
-					suffix = " IN TABLE " + escapedCatalog + "." + escapedSchema + "." + escapedTable
-				}
-			}
-		}
-
-		emptyPkUkQuery := `SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "constraint_name", NULL::VARCHAR AS "column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE`
-		emptyFkQuery := `SELECT NULL::VARCHAR AS "fk_database_name", NULL::VARCHAR AS "fk_schema_name", NULL::VARCHAR AS "fk_table_name", NULL::VARCHAR AS "fk_name", NULL::VARCHAR AS "fk_column_name", NULL::VARCHAR AS "pk_database_name", NULL::VARCHAR AS "pk_schema_name", NULL::VARCHAR AS "pk_table_name", NULL::VARCHAR AS "pk_column_name", NULL::NUMBER AS "key_sequence" WHERE FALSE`
-		emptyColumnsQuery := `SELECT NULL::VARCHAR AS "database_name", NULL::VARCHAR AS "schema_name", NULL::VARCHAR AS "table_name", NULL::VARCHAR AS "column_name", NULL::VARCHAR AS "data_type" WHERE FALSE`
-
-		// Detailed constraint info not available in information_schema
-		// Need to dispatch SHOW queries and use conn.Raw to extract the queryID for reuse in GetObjects query
-		gQueryIDs.Go(func() (err error) {
-			query := "SHOW PRIMARY KEYS /* ADBC:getObjectsTables */" + suffix
-			if hasEmptyLiteralFilter(c.matchExactly, catalog, dbSchema, tableName) {
-				query = emptyPkUkQuery
-			}
-			pkQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyPkUkQuery)
-			return err
-		})
-
-		gQueryIDs.Go(func() (err error) {
-			query := "SHOW IMPORTED KEYS /* ADBC:getObjectsTables */" + suffix
-			if hasEmptyLiteralFilter(c.matchExactly, catalog, dbSchema, tableName) {
-				query = emptyFkQuery
-			}
-			fkQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyFkQuery)
-			return err
-		})
-
-		gQueryIDs.Go(func() (err error) {
-			query := "SHOW UNIQUE KEYS /* ADBC:getObjectsTables */" + suffix
-			if hasEmptyLiteralFilter(c.matchExactly, catalog, dbSchema, tableName) {
-				query = emptyPkUkQuery
-			}
-			uniqueQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyPkUkQuery)
-			return err
-		})
-
-		columnsCatalog, columnsSchema := catalog, dbSchema
-		if scope.catalog != nil {
-			columnsCatalog = scope.catalog
-		}
-		if scope.dbSchema != nil {
-			columnsSchema = scope.dbSchema
-		}
-		columnsSuffix := showColumnsScope(columnsCatalog, columnsSchema, tableName, c.matchExactly)
-		gQueryIDs.Go(func() (err error) {
-			query := "SHOW COLUMNS /* ADBC:getObjects */" + columnsSuffix
-			if hasEmptyLiteralFilter(c.matchExactly, catalog, dbSchema, tableName, columnName) {
-				query = emptyColumnsQuery
-			}
-			columnsQueryID, err = getQueryID(gQueryIDsCtx, query, conn, emptyColumnsQuery)
-			return err
-		})
-
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objDatabases, &scope,
-			catalog, dbSchema, tableName, c.matchExactly, &terseDbQueryID)
-		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objSchemas, &scope,
-			catalog, dbSchema, tableName, c.matchExactly, &showSchemaQueryID)
-
-		objType := objObjects
-		if len(tableType) == 1 {
-			if strings.EqualFold("VIEW", tableType[0]) {
-				objType = objViews
-			} else if strings.EqualFold("TABLE", tableType[0]) {
-				objType = objTables
-			}
-		}
 		goGetQueryID(gQueryIDsCtx, conn, gQueryIDs, objType, &scope,
 			catalog, dbSchema, tableName, c.matchExactly, &tableQueryID)
 	}
