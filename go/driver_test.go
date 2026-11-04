@@ -2062,6 +2062,112 @@ func (suite *SnowflakeTests) TestTimezonePrecision() {
 	suite.queryTimestamps(query_ns, expectedMicrosecondsResults_ns, expectedNanosecondResults_ns, false)
 }
 
+// Each TIMESTAMP type at every scale, before and after the epoch, in each
+// timestamp precision mode. Snowflake sends these as int64 or as structs of
+// epoch, fraction and timezone depending on the type and scale.
+func (suite *SnowflakeTests) TestTimestampScales() {
+	zone := time.FixedZone("+0530", 5*3600+30*60)
+	instants := []time.Time{
+		time.Date(2025, 6, 2, 10, 37, 56, 123456789, zone),
+		time.Date(1969, 12, 31, 23, 59, 59, 987654321, zone),
+	}
+	const scales = 10
+	truncate := func(t time.Time, scale int) time.Time {
+		return t.Truncate(time.Duration(math.Pow10(9 - scale)))
+	}
+	literal := func(typ string, t time.Time, scale int) string {
+		lit := truncate(t, scale).Format("2006-01-02 15:04:05.000000000")
+		lit = strings.TrimSuffix(lit[:len(lit)-(9-scale)], ".")
+		if typ != "TIMESTAMP_NTZ" {
+			lit += t.Format(" -0700")
+		}
+		return "'" + lit + "'"
+	}
+
+	for _, mode := range []string{driver.OptionValueNanoseconds, driver.OptionValueNanosecondsNoOverflow, driver.OptionValueMicroseconds} {
+		opts := suite.Quirks.DatabaseOptions()
+		opts[driver.OptionMaxTimestampPrecision] = mode
+		db, err := suite.driver.NewDatabaseWithContext(suite.ctx, opts)
+		suite.Require().NoError(err)
+		cnxn, err := db.Open(suite.ctx)
+		suite.Require().NoError(err)
+		stmt, err := cnxn.NewStatement(suite.ctx)
+		suite.Require().NoError(err)
+
+		for _, typ := range []string{"TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"} {
+			var cols []string
+			for scale := range scales {
+				cols = append(cols, fmt.Sprintf("column%d::%s(%d) AS s%d", scale+1, typ, scale, scale))
+			}
+			var rows []string
+			for i, t := range instants {
+				var vals []string
+				for scale := range scales {
+					vals = append(vals, literal(typ, t, scale))
+				}
+				rows = append(rows, fmt.Sprintf("(%s, %d)", strings.Join(vals, ", "), i))
+			}
+			rows = append(rows, fmt.Sprintf("(%s%d)", strings.Repeat("NULL, ", scales), len(instants)))
+			query := fmt.Sprintf("SELECT %s FROM VALUES %s ORDER BY column%d", strings.Join(cols, ", "), strings.Join(rows, ", "), scales+1)
+
+			suite.Run(typ+"/"+mode, func() {
+				suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, query))
+				rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+				suite.Require().NoError(err)
+				defer rdr.Release()
+				var got [scales][]*arrow.Timestamp
+				var units [scales]arrow.TimeUnit
+				for rdr.Next() {
+					rec := rdr.RecordBatch()
+					for scale := range scales {
+						col := rec.Column(scale).(*array.Timestamp)
+						units[scale] = col.DataType().(*arrow.TimestampType).Unit
+						for i := range col.Len() {
+							if col.IsNull(i) {
+								got[scale] = append(got[scale], nil)
+							} else {
+								v := col.Value(i)
+								got[scale] = append(got[scale], &v)
+							}
+						}
+					}
+				}
+				suite.Require().NoError(rdr.Err())
+
+				for scale := range scales {
+					unit := arrow.Nanosecond
+					switch {
+					case scale == 0:
+						unit = arrow.Second
+					case scale <= 3:
+						unit = arrow.Millisecond
+					case scale <= 6 || mode == driver.OptionValueMicroseconds:
+						unit = arrow.Microsecond
+					}
+					suite.Equal(unit, units[scale], "scale %d", scale)
+					suite.Require().Len(got[scale], len(instants)+1, "scale %d", scale)
+					for i, t := range instants {
+						if typ == "TIMESTAMP_NTZ" {
+							// The wall-clock time, read as UTC.
+							t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+						}
+						want, err := arrow.TimestampFromTime(truncate(t, scale), unit)
+						suite.Require().NoError(err)
+						if suite.NotNil(got[scale][i], "scale %d row %d", scale, i) {
+							suite.Equal(want, *got[scale][i], "scale %d row %d", scale, i)
+						}
+					}
+					suite.Nil(got[scale][len(instants)], "scale %d null row", scale)
+				}
+			})
+		}
+
+		suite.Require().NoError(stmt.Close(suite.ctx))
+		suite.Require().NoError(cnxn.Close(suite.ctx))
+		suite.Require().NoError(db.Close(suite.ctx))
+	}
+}
+
 func (suite *SnowflakeTests) queryTimestamps(query string, expectedMicrosecondResults []arrow.Timestamp, expectedNanosecondResults []arrow.Timestamp, testOverflow ...bool) {
 	// Default testOverflow to true if not specified
 	shouldTestOverflow := true
