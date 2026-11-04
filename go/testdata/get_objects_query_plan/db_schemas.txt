@@ -1,0 +1,45 @@
+# Statements GetObjects sends at this depth, sorted. Regenerate with -update.
+
+## no filters: 3 statement(s), 2 IN ACCOUNT
+    <queries/get_objects_dbschemas.sql>
+        CATALOG="%" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="" FK_QUERY_ID="" UNIQUE_QUERY_ID="" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="" SHOW_COLUMNS_QUERY_ID=""
+    SHOW TERSE /* ADBC:getObjects */ DATABASES IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN ACCOUNT
+
+## plain names DB/SCH/TBL: 1 statement(s), 0 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
+
+## underscore names MY_DB/MY_SCH/MY_TBL: 3 statement(s), 2 IN ACCOUNT
+    <queries/get_objects_dbschemas.sql>
+        CATALOG="MY_DB" DB_SCHEMA="MY_SCH" TABLE="MY_TBL" COLUMN="%" PK_QUERY_ID="" FK_QUERY_ID="" UNIQUE_QUERY_ID="" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="" SHOW_COLUMNS_QUERY_ID=""
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'MY_SCH' IN ACCOUNT
+
+## underscore catalog only MY_DB: 3 statement(s), 2 IN ACCOUNT
+    <queries/get_objects_dbschemas.sql>
+        CATALOG="MY_DB" DB_SCHEMA="%" TABLE="%" COLUMN="%" PK_QUERY_ID="" FK_QUERY_ID="" UNIQUE_QUERY_ID="" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="" SHOW_COLUMNS_QUERY_ID=""
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'MY_DB' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN ACCOUNT
+
+## percent patterns DB%/SCH%/TBL%: 3 statement(s), 2 IN ACCOUNT
+    <queries/get_objects_dbschemas.sql>
+        CATALOG="DB%" DB_SCHEMA="SCH%" TABLE="TBL%" COLUMN="%" PK_QUERY_ID="" FK_QUERY_ID="" UNIQUE_QUERY_ID="" SHOW_DB_QUERY_ID="<id>" SHOW_SCHEMA_QUERY_ID="<id>" SHOW_TABLE_QUERY_ID="" SHOW_COLUMNS_QUERY_ID=""
+    SHOW TERSE /* ADBC:getObjects */ DATABASES LIKE 'DB%' IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH%' IN ACCOUNT
+
+## plain names with column filter COL: 1 statement(s), 0 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
+
+## plain names with table type VIEW: 1 statement(s), 0 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
+
+## plain names with unknown table type: 1 statement(s), 0 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS LIKE 'SCH' IN DATABASE "DB"
+
+## match exactly MY_DB/MY_SCH/MY_TBL: 1 statement(s), 0 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "MY_DB" STARTS WITH 'MY_SCH'
+
+## match exactly catalog only MY_DB: 1 statement(s), 0 IN ACCOUNT
+    SHOW TERSE /* ADBC:getObjects */ SCHEMAS IN DATABASE "MY_DB"
+
+## match exactly empty schema: 0 statement(s), 0 IN ACCOUNT
