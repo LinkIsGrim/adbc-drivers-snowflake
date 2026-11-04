@@ -3744,6 +3744,69 @@ func (suite *SnowflakeTests) TestGetStatisticNames() {
 	suite.Equal(int64(6), rec.NumRows())
 }
 
+// GetStatistics across every database returns the same statistics for each
+// table as a call narrowed to that table's schema.
+func (suite *SnowflakeTests) TestGetStatisticsAcrossDatabases() {
+	schemas := []string{"ADBC_STATS_S0", "ADBC_STATS_S1", "ADBC_STATS_S2"}
+	tables := []string{"PLAIN", "CLUSTERED"}
+	for _, schema := range schemas {
+		for _, q := range []string{
+			"CREATE SCHEMA IF NOT EXISTS " + schema,
+			"CREATE TABLE IF NOT EXISTS " + schema + ".PLAIN (id INTEGER, name VARCHAR)",
+			"CREATE TABLE IF NOT EXISTS " + schema + ".CLUSTERED (id INTEGER, name VARCHAR) CLUSTER BY (id)",
+		} {
+			suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, q))
+			_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+			suite.Require().NoError(err, q)
+		}
+	}
+
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT CURRENT_DATABASE()"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	suite.Require().True(rdr.Next())
+	currentDb := rdr.RecordBatch().Column(0).(*array.String).Value(0)
+	rdr.Release()
+
+	gs := suite.cnxn.(adbc.ConnectionGetStatistics)
+	getStats := func(catalog *string, schema string, approximate bool) map[string][]testutil.Statistic {
+		rdr, err := gs.GetStatistics(suite.ctx, catalog, &schema, nil, approximate)
+		suite.Require().NoError(err)
+		defer rdr.Release()
+		stats := map[string][]testutil.Statistic{}
+		for rdr.Next() {
+			for _, s := range schemas {
+				for _, t := range tables {
+					stats[s+"."+t] = append(stats[s+"."+t], testutil.ExtractStatisticsForTable(rdr.RecordBatch(), currentDb, s, t)...)
+				}
+			}
+		}
+		suite.Require().NoError(rdr.Err())
+		return stats
+	}
+
+	for _, approximate := range []bool{true, false} {
+		suite.Run(fmt.Sprintf("approximate=%v", approximate), func() {
+			all := getStats(nil, "ADBC_STATS_S_", approximate)
+			for _, s := range schemas {
+				narrow := getStats(&currentDb, s, approximate)
+				for _, t := range tables {
+					name := s + "." + t
+					byKey := testutil.StatisticsToLookupMap(all[name])
+					for _, key := range []int16{adbc.StatisticRowCountKey, driver.SnowflakeStatisticBytesKey, driver.SnowflakeStatisticRetentionTimeDaysKey} {
+						suite.Contains(byKey, key, "%s: statistic %d", name, key)
+					}
+					if !approximate {
+						_, hasDepth := byKey[driver.SnowflakeStatisticClusteringDepthKey]
+						suite.Equal(t == "CLUSTERED", hasDepth, "%s: clustering depth", name)
+					}
+					suite.ElementsMatch(narrow[name], all[name], name)
+				}
+			}
+		})
+	}
+}
+
 func (suite *SnowflakeTests) TestGetStatisticsBasic() {
 	// Create a persistent test table (if not exists) to ensure consistent results
 	// across test runs despite INFORMATION_SCHEMA caching
