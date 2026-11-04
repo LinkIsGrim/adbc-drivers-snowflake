@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +30,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/stretchr/testify/assert"
@@ -1157,5 +1160,493 @@ func BenchmarkDecodeJSONChunkRows(b *testing.B) {
 		if err := decodeJSONChunkRows(data, cols, dst); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// timestampColumn builds a column in one of the layouts Snowflake sends
+// timestamps in: int64 when every value has one part, otherwise a struct of
+// epoch with fraction and/or timezone. Each row is one value's parts; a nil
+// row is null.
+func timestampColumn(mem memory.Allocator, withOffset bool, rows ...[]int64) arrow.Array {
+	parts := 0
+	for _, r := range rows {
+		parts = max(parts, len(r))
+	}
+	if parts == 1 {
+		b := array.NewInt64Builder(mem)
+		defer b.Release()
+		for _, r := range rows {
+			if r == nil {
+				b.AppendNull()
+			} else {
+				b.Append(r[0])
+			}
+		}
+		return b.NewArray()
+	}
+	fields := []arrow.Field{{Name: "epoch", Type: arrow.PrimitiveTypes.Int64}}
+	if parts == 3 || !withOffset {
+		fields = append(fields, arrow.Field{Name: "fraction", Type: arrow.PrimitiveTypes.Int32})
+	}
+	if withOffset {
+		fields = append(fields, arrow.Field{Name: "timezone", Type: arrow.PrimitiveTypes.Int32})
+	}
+	sb := array.NewStructBuilder(mem, arrow.StructOf(fields...))
+	defer sb.Release()
+	for _, r := range rows {
+		if r == nil {
+			sb.AppendNull()
+			continue
+		}
+		sb.Append(true)
+		sb.FieldBuilder(0).(*array.Int64Builder).Append(r[0])
+		for f := 1; f < len(r); f++ {
+			sb.FieldBuilder(f).(*array.Int32Builder).Append(int32(r[f]))
+		}
+	}
+	return sb.NewArray()
+}
+
+func TestTimestampTransformer(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(context.Background(), mem)
+
+	const overflow = "overflow"
+	modes := []MaxTimestampPrecision{Nanoseconds, NanosecondsNoOverflow, Microseconds}
+	// want holds the result for Nanoseconds, NanosecondsNoOverflow and
+	// Microseconds, in the unit getArrowTimeUnit picks for each.
+	cases := []struct {
+		name       string
+		withOffset bool
+		scale      int64
+		in         []int64
+		want       [3]any
+	}{
+		{"scale 0", false, 0, []int64{1717200000}, [3]any{1717200000, 1717200000, 1717200000}},
+		{"scale 0 before epoch", false, 0, []int64{-1}, [3]any{-1, -1, -1}},
+		{"scale 0 beyond nanoseconds", false, 0, []int64{9223372037}, [3]any{9223372037, 9223372037, 9223372037}},
+		{"scale 3", false, 3, []int64{1717200000123}, [3]any{1717200000123, 1717200000123, 1717200000123}},
+		{"scale 3 before epoch", false, 3, []int64{-1}, [3]any{-1, -1, -1}},
+		{"scale 7", false, 7, []int64{17172000001234567}, [3]any{1717200000123456700, 1717200000123456700, 1717200000123456}},
+		{"scale 7 before epoch", false, 7, []int64{-1}, [3]any{-100, -100, -1}},
+		{"scale 7 before epoch, whole microseconds", false, 7, []int64{-10000001}, [3]any{-1000000100, -1000000100, -1000001}},
+		{"scale 7 max", false, 7, []int64{math.MaxInt64}, [3]any{-100, overflow, 922337203685477580}},
+		{"scale 7 min", false, 7, []int64{math.MinInt64}, [3]any{0, overflow, -922337203685477581}},
+		{"scale 8", false, 8, []int64{1717200000, 123456780}, [3]any{1717200000123456780, 1717200000123456780, 1717200000123456}},
+		{"scale 8 before epoch", false, 8, []int64{-1, 500000000}, [3]any{-500000000, -500000000, -500000}},
+		{"scale 9", false, 9, []int64{1717200000, 123456789}, [3]any{1717200000123456789, 1717200000123456789, 1717200000123456}},
+		{"scale 9 largest nanoseconds", false, 9, []int64{9223372036, 854775807}, [3]any{int64(math.MaxInt64), int64(math.MaxInt64), 9223372036854775}},
+		{"scale 9 past largest nanoseconds", false, 9, []int64{9223372036, 854775808}, [3]any{int64(math.MinInt64), overflow, 9223372036854775}},
+		{"scale 9 before smallest nanoseconds", false, 9, []int64{-9223372037, 145224191}, [3]any{int64(math.MaxInt64), overflow, -9223372036854776}},
+		{"scale 9 year 9999", false, 9, []int64{253402300799, 999999999}, [3]any{-4852116231933722625, overflow, 253402300799999999}},
+		{"TZ scale 3", true, 3, []int64{1717200000123, 1500}, [3]any{1717200000123, 1717200000123, 1717200000123}},
+		{"TZ scale 3 before epoch", true, 3, []int64{-1, 1380}, [3]any{-1, -1, -1}},
+		{"TZ scale 9", true, 9, []int64{1717200000, 5, 1500}, [3]any{1717200000000000005, 1717200000000000005, 1717200000000000}},
+		{"TZ scale 9 before epoch", true, 9, []int64{-1, 999999999, 1440}, [3]any{-1, -1, -1}},
+		{"TZ scale 9 beyond nanoseconds", true, 9, []int64{9223372037, 0, 1440}, [3]any{-9223372036709551616, overflow, 9223372037000000}},
+	}
+	for _, tc := range cases {
+		for i, mode := range modes {
+			t.Run(fmt.Sprintf("%s/%v", tc.name, mode), func(t *testing.T) {
+				tz := ""
+				if tc.withOffset {
+					tz = "UTC"
+				}
+				dt := &arrow.TimestampType{Unit: getArrowTimeUnit(tc.scale, mode), TimeZone: tz}
+				in := timestampColumn(mem, tc.withOffset, tc.in)
+				defer in.Release()
+				got, err := timestampTransformer(tc.withOffset, dt, tc.scale, getArrowTimeUnit(tc.scale, Nanoseconds), mode, nil)(ctx, in)
+				if tc.want[i] == overflow {
+					assert.ErrorContains(t, err, "timestamp")
+					return
+				}
+				require.NoError(t, err)
+				defer got.Release()
+				assert.True(t, arrow.TypeEqual(dt, got.DataType()), "type %v", got.DataType())
+				var want int64
+				switch w := tc.want[i].(type) {
+				case int:
+					want = int64(w)
+				case int64:
+					want = w
+				}
+				assert.Equal(t, []arrow.Timestamp{arrow.Timestamp(want)}, got.(*array.Timestamp).TimestampValues())
+			})
+		}
+	}
+}
+
+func TestTimestampTransformerNullsAndSlices(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(context.Background(), mem)
+
+	for _, tc := range []struct {
+		name       string
+		withOffset bool
+		scale      int64
+		rows       [][]int64
+		want       []arrow.Timestamp // nanoseconds
+	}{
+		{"int64", false, 7, [][]int64{{1}, nil, {-1}, {17172000001234567}, nil}, []arrow.Timestamp{100, 0, -100, 1717200000123456700, 0}},
+		{"epoch and fraction", false, 9, [][]int64{{1, 2}, nil, {-1, 500000000}, {1717200000, 123456789}, nil}, []arrow.Timestamp{1000000002, 0, -500000000, 1717200000123456789, 0}},
+		{"epoch, fraction and timezone", true, 9, [][]int64{{1, 2, 1440}, nil, {-1, 500000000, 1500}, {1717200000, 123456789, 1380}, nil}, []arrow.Timestamp{1000000002, 0, -500000000, 1717200000123456789, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			full := timestampColumn(mem, tc.withOffset, tc.rows...)
+			defer full.Release()
+			sliced := array.NewSlice(full, 1, 4)
+			defer sliced.Release()
+			dt := &arrow.TimestampType{Unit: arrow.Nanosecond}
+			if tc.withOffset {
+				dt.TimeZone = "UTC"
+			}
+			fn := timestampTransformer(tc.withOffset, dt, tc.scale, arrow.Nanosecond, Nanoseconds, nil)
+			for _, c := range []struct {
+				in   arrow.Array
+				want []arrow.Timestamp
+			}{{full, tc.want}, {sliced, tc.want[1:4]}} {
+				got, err := fn(ctx, c.in)
+				require.NoError(t, err)
+				ts := got.(*array.Timestamp)
+				require.Equal(t, c.in.Len(), ts.Len())
+				for i := range ts.Len() {
+					assert.Equal(t, c.in.IsNull(i), ts.IsNull(i), "row %d", i)
+					if !ts.IsNull(i) {
+						assert.Equal(t, c.want[i], ts.Value(i), "row %d", i)
+					}
+				}
+				got.Release()
+			}
+		})
+	}
+}
+
+// Values that are already in the output unit share the input's buffer.
+func TestTimestampTransformerPassThrough(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+	ctx := compute.WithAllocator(context.Background(), mem)
+
+	sameBuffer := func(t *testing.T, got arrow.Array, values *memory.Buffer) {
+		t.Helper()
+		assert.Same(t, &values.Bytes()[0], &got.Data().Buffers()[1].Bytes()[0], "values were copied")
+	}
+	values := func(a arrow.Array) []arrow.Timestamp {
+		ts := a.(*array.Timestamp)
+		out := make([]arrow.Timestamp, ts.Len())
+		for i := range out {
+			if ts.IsValid(i) {
+				out[i] = ts.Value(i)
+			}
+		}
+		return out
+	}
+	ms := &arrow.TimestampType{Unit: arrow.Millisecond}
+	msUTC := &arrow.TimestampType{Unit: arrow.Millisecond, TimeZone: "UTC"}
+
+	t.Run("int64", func(t *testing.T) {
+		in := timestampColumn(mem, false, []int64{1717200000123}, nil, []int64{-1})
+		defer in.Release()
+		sliced := array.NewSlice(in, 1, 3)
+		defer sliced.Release()
+		fn := timestampTransformer(false, ms, 3, arrow.Millisecond, Nanoseconds, nil)
+		for _, c := range []struct {
+			in   arrow.Array
+			want []arrow.Timestamp
+		}{{in, []arrow.Timestamp{1717200000123, 0, -1}}, {sliced, []arrow.Timestamp{0, -1}}} {
+			got, err := fn(ctx, c.in)
+			require.NoError(t, err)
+			assert.True(t, arrow.TypeEqual(ms, got.DataType()))
+			assert.Equal(t, c.in.NullN(), got.NullN())
+			assert.Equal(t, c.want, values(got))
+			sameBuffer(t, got, in.Data().Buffers()[1])
+			got.Release()
+		}
+	})
+
+	t.Run("outlives input", func(t *testing.T) {
+		in := timestampColumn(mem, false, []int64{1}, []int64{2}, []int64{3})
+		got, err := timestampTransformer(false, &arrow.TimestampType{Unit: arrow.Second}, 0, arrow.Second, Nanoseconds, nil)(ctx, in)
+		require.NoError(t, err)
+		in.Release()
+		assert.Equal(t, []arrow.Timestamp{1, 2, 3}, got.(*array.Timestamp).TimestampValues())
+		got.Release()
+	})
+
+	t.Run("out of range value in a null slot", func(t *testing.T) {
+		ns := &arrow.TimestampType{Unit: arrow.Nanosecond}
+		ib := array.NewInt64Builder(mem)
+		ib.AppendValues([]int64{0, math.MinInt64, 5}, []bool{true, false, true})
+		in := ib.NewArray()
+		ib.Release()
+		defer in.Release()
+		got, err := timestampTransformer(false, ns, 9, arrow.Nanosecond, NanosecondsNoOverflow, nil)(ctx, in)
+		require.NoError(t, err)
+		assert.Equal(t, []arrow.Timestamp{0, 0, 5}, values(got))
+		sameBuffer(t, got, in.Data().Buffers()[1])
+		got.Release()
+
+		ib = array.NewInt64Builder(mem)
+		ib.AppendValues([]int64{0, math.MinInt64}, nil)
+		bad := ib.NewArray()
+		ib.Release()
+		defer bad.Release()
+		_, err = timestampTransformer(false, ns, 9, arrow.Nanosecond, NanosecondsNoOverflow, nil)(ctx, bad)
+		assert.ErrorContains(t, err, "overflows when converted to nanoseconds")
+	})
+
+	t.Run("epoch and timezone", func(t *testing.T) {
+		in := timestampColumn(mem, true, []int64{1717200000123, 1500}, nil, []int64{-1, 1380})
+		defer in.Release()
+		sliced := array.NewSlice(in, 1, 3)
+		defer sliced.Release()
+		fn := timestampTransformer(true, msUTC, 3, arrow.Millisecond, Nanoseconds, nil)
+		epochs := in.(*array.Struct).Field(0).Data().Buffers()[1]
+		for _, c := range []struct {
+			in   arrow.Array
+			want []arrow.Timestamp
+		}{{in, []arrow.Timestamp{1717200000123, 0, -1}}, {sliced, []arrow.Timestamp{0, -1}}} {
+			got, err := fn(ctx, c.in)
+			require.NoError(t, err)
+			assert.True(t, arrow.TypeEqual(msUTC, got.DataType()))
+			assert.Equal(t, c.want, values(got))
+			sameBuffer(t, got, epochs)
+			got.Release()
+		}
+	})
+
+	t.Run("struct children offset from the struct", func(t *testing.T) {
+		// The struct's validity starts at 0 but its children's values
+		// don't, so they can't be shared.
+		long := timestampColumn(mem, false, []int64{10}, []int64{11}, []int64{12}, []int64{13})
+		defer long.Release()
+		epochs := array.NewSlice(long, 1, 4)
+		defer epochs.Release()
+		zb := array.NewInt32Builder(mem)
+		zb.AppendValues([]int32{1500, 1500, 1500, 1500}, nil)
+		zonesFull := zb.NewArray()
+		zb.Release()
+		defer zonesFull.Release()
+		zones := array.NewSlice(zonesFull, 1, 4)
+		defer zones.Release()
+		in, err := array.NewStructArrayWithFields([]arrow.Array{epochs, zones}, []arrow.Field{
+			{Name: "epoch", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "timezone", Type: arrow.PrimitiveTypes.Int32},
+		})
+		require.NoError(t, err)
+		defer in.Release()
+		require.NotEqual(t, in.Data().Offset(), in.Field(0).Data().Offset())
+
+		got, err := timestampTransformer(true, msUTC, 3, arrow.Millisecond, Nanoseconds, nil)(ctx, in)
+		require.NoError(t, err)
+		assert.Equal(t, []arrow.Timestamp{11, 12, 13}, values(got))
+		assert.NotSame(t, &long.Data().Buffers()[1].Bytes()[0], &got.Data().Buffers()[1].Bytes()[0])
+		got.Release()
+	})
+}
+
+// BenchmarkTimestampTransformer uses the representations Snowflake sends:
+// TIMESTAMP_NTZ/LTZ are int64 up to scale 7 and (epoch, fraction) above it, and
+// TIMESTAMP_TZ is (epoch, timezone) up to scale 3 and (epoch, fraction,
+// timezone) above it.
+func BenchmarkTimestampTransformer(b *testing.B) {
+	r := rand.New(rand.NewPCG(1, 2))
+	const n = 1 << 16
+	const epochSeconds = 1717200000
+	compact := func(scale int64) arrow.Array {
+		pow := int64(math.Pow10(int(scale)))
+		ib := array.NewInt64Builder(memory.DefaultAllocator)
+		defer ib.Release()
+		for i := range n {
+			if i%17 == 0 {
+				ib.AppendNull()
+				continue
+			}
+			ib.Append((epochSeconds+r.Int64N(1e9)-5e8)*pow + r.Int64N(pow))
+		}
+		return ib.NewArray()
+	}
+	structOf := func(fields ...string) arrow.Array {
+		var fs []arrow.Field
+		for _, f := range fields {
+			typ := arrow.DataType(arrow.PrimitiveTypes.Int32)
+			if f == "epoch" {
+				typ = arrow.PrimitiveTypes.Int64
+			}
+			fs = append(fs, arrow.Field{Name: f, Type: typ})
+		}
+		sb := array.NewStructBuilder(memory.DefaultAllocator, arrow.StructOf(fs...))
+		defer sb.Release()
+		for i := range n {
+			if i%17 == 0 {
+				sb.AppendNull()
+				continue
+			}
+			sb.Append(true)
+			for f, name := range fields {
+				switch name {
+				case "epoch":
+					if len(fields) == 2 && fields[1] == "timezone" {
+						// Compact TIMESTAMP_TZ at scale 3.
+						sb.FieldBuilder(f).(*array.Int64Builder).Append((epochSeconds+r.Int64N(1e9)-5e8)*1000 + r.Int64N(1000))
+					} else {
+						sb.FieldBuilder(f).(*array.Int64Builder).Append(epochSeconds + r.Int64N(1e9) - 5e8)
+					}
+				case "fraction":
+					sb.FieldBuilder(f).(*array.Int32Builder).Append(r.Int32N(1e9))
+				case "timezone":
+					sb.FieldBuilder(f).(*array.Int32Builder).Append(1440 + 60)
+				}
+			}
+		}
+		return sb.NewArray()
+	}
+
+	ntz6, ntz7 := compact(6), compact(7)
+	ntz9 := structOf("epoch", "fraction")
+	tz3 := structOf("epoch", "timezone")
+	tz9 := structOf("epoch", "fraction", "timezone")
+	for _, a := range []arrow.Array{ntz6, ntz7, ntz9, tz3, tz9} {
+		defer a.Release()
+	}
+
+	ctx := compute.WithAllocator(context.Background(), memory.DefaultAllocator)
+	cases := []struct {
+		name       string
+		in         arrow.Array
+		scale      int64
+		mode       MaxTimestampPrecision
+		withOffset bool
+	}{
+		// Already in the output unit: passed through.
+		{"NTZ_6", ntz6, 6, Nanoseconds, false},
+		{"TZ_3", tz3, 3, Nanoseconds, true},
+		// Rescaled per value.
+		{"NTZ_7", ntz7, 7, Nanoseconds, false},
+		{"NTZ_9", ntz9, 9, Nanoseconds, false},
+		{"NTZ_9_Micro", ntz9, 9, Microseconds, false},
+		{"TZ_9", tz9, 9, Nanoseconds, true},
+	}
+	for _, c := range cases {
+		tz := ""
+		if c.withOffset {
+			tz = "UTC"
+		}
+		dt := &arrow.TimestampType{Unit: getArrowTimeUnit(c.scale, c.mode), TimeZone: tz}
+		orig := getArrowTimeUnit(c.scale, Nanoseconds)
+		fn := timestampTransformer(c.withOffset, dt, c.scale, orig, c.mode, nil)
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				out, err := fn(ctx, c.in)
+				if err != nil {
+					b.Fatal(err)
+				}
+				out.Release()
+			}
+		})
+	}
+}
+
+func TestDecimal128FromPlainString(t *testing.T) {
+	for _, tc := range []struct {
+		s           string
+		prec, scale int32
+	}{
+		{"0", 38, 0},
+		{"-0", 38, 0},
+		{"1", 38, 0},
+		{"-1", 38, 0},
+		{"000123", 38, 0},
+		{"999999999999999999", 38, 0},
+		{"-999999999999999999", 18, 0},
+		{"123.45", 10, 2},
+		{"12.3", 10, 2},
+		{"-12.30", 10, 2},
+		{"-0.5", 10, 2},
+		{".5", 10, 2},
+		{"1.", 10, 2},
+		{"99999999.99", 10, 2},
+		{"0.000001", 38, 6},
+		{"1", 38, 37},
+		{"-123456789012345678", 38, 20},
+	} {
+		want, err := decimal128.FromString(tc.s, tc.prec, tc.scale)
+		require.NoError(t, err, tc.s)
+		got, ok := decimal128FromPlainString(tc.s, tc.prec, tc.scale)
+		assert.True(t, ok, tc.s)
+		assert.Equal(t, want, got, tc.s)
+	}
+
+	// Inputs left to decimal128.FromString.
+	for _, tc := range []struct {
+		s           string
+		prec, scale int32
+	}{
+		{"", 38, 2},
+		{"-", 38, 2},
+		{".", 38, 2},
+		{"+1", 38, 2},
+		{" 1", 38, 2},
+		{"1e5", 38, 2},
+		{"1.2.3", 38, 2},
+		{"abc", 38, 2},
+		{"1234567890123456789", 38, 0},
+		{"1.234", 38, 2},
+		{"1000.00", 5, 2},
+		{"1", 38, 38},
+	} {
+		_, ok := decimal128FromPlainString(tc.s, tc.prec, tc.scale)
+		assert.False(t, ok, tc.s)
+	}
+}
+
+func TestExtractTimestamp(t *testing.T) {
+	for _, tc := range []struct {
+		in        string
+		sec, nsec int64
+	}{
+		{"1700000000", 1700000000, 0},
+		{"1700000000.5", 1700000000, 500_000_000},
+		{"1700000000.000001", 1700000000, 1_000},
+		{"1700000000.123456789", 1700000000, 123_456_789},
+		{"-1.5", -1, 500_000_000},
+		{"1.", 1, 0},
+	} {
+		sec, nsec, err := extractTimestamp(&tc.in)
+		require.NoError(t, err, tc.in)
+		assert.Equal(t, tc.sec, sec, tc.in)
+		assert.Equal(t, tc.nsec, nsec, tc.in)
+	}
+	for _, in := range []string{"", "x", "1.x", "1.1234567890"} {
+		_, _, err := extractTimestamp(&in)
+		assert.Error(t, err, in)
+	}
+}
+
+func TestJSONDataToArrowTimestampTZ(t *testing.T) {
+	sc := arrow.NewSchema([]arrow.Field{{
+		Name:     "tz",
+		Type:     &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"},
+		Nullable: true,
+		Metadata: arrow.NewMetadata([]string{MetadataKeySnowflakeType}, []string{"timestamp_tz"}),
+	}}, nil)
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, sc)
+	defer bldr.Release()
+
+	// The offset is minutes from UTC plus 1440.
+	val := "1700000000.000001 1500"
+	rec, err := jsonDataToArrow(context.Background(), bldr, [][]*string{{&val}, {nil}}, Nanoseconds)
+	require.NoError(t, err)
+	defer rec.Release()
+	col := rec.Column(0).(*array.Timestamp)
+	assert.Equal(t, arrow.Timestamp(1700000000_000001), col.Value(0))
+	assert.True(t, col.IsNull(1))
+
+	for _, bad := range []string{"1700000000", "1700000000 1500 1", "1700000000 x"} {
+		_, err := jsonDataToArrow(context.Background(), bldr, [][]*string{{&bad}}, Nanoseconds)
+		assert.ErrorContains(t, err, "invalid TIMESTAMP_TZ data", bad)
 	}
 }

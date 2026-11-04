@@ -20,6 +20,11 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
+-- GetObjects at Columns depth for a single database. %[1]s is the quoted
+-- database name; its information_schema only covers that database, so the
+-- query runs once per catalog. The SHOW results read through RESULT_SCAN may
+-- cover more than this database; they are only joined against it.
+
 WITH show_columns AS (
     SELECT
         "database_name" table_catalog,
@@ -48,7 +53,7 @@ columns AS (
         	'xdbc_num_prec_radix': numeric_precision_radix,
         	'xdbc_datetime_sub': datetime_precision
         }) WITHIN GROUP (ORDER BY ordinal_position) table_columns,
-    FROM information_schema.columns c
+    FROM %[1]s.information_schema.columns c
     LEFT JOIN show_columns sc
       ON c.table_catalog = sc.table_catalog
      AND c.table_schema = sc.table_schema
@@ -131,7 +136,7 @@ SELECT
         'table_columns': COALESCE(table_columns, []),
         'table_constraints': COALESCE(table_constraints, [])
     }, {})) db_schema_tables
-FROM information_schema.tables
+FROM %[1]s.information_schema.tables
 LEFT JOIN columns
 USING (table_catalog, table_schema, table_name)
 LEFT JOIN constraints
@@ -144,22 +149,17 @@ db_schemas AS (
         catalog_name,
         schema_name,
         COALESCE(db_schema_tables, []) db_schema_tables,
-    FROM information_schema.schemata
+    FROM %[1]s.information_schema.schemata
     LEFT JOIN tables
     USING (catalog_name, schema_name)
     WHERE catalog_name ILIKE :CATALOG ESCAPE '!' AND schema_name ILIKE :DB_SCHEMA ESCAPE '!'
 )
 SELECT
     {
-        'catalog_name': database_name,
+        'catalog_name': :DB_NAME,
         'catalog_db_schemas': ARRAY_AGG(NULLIF({
             'db_schema_name': schema_name,
             'db_schema_tables': db_schema_tables
         }, {}))
     } get_objects
-FROM
-    information_schema.databases
-LEFT JOIN db_schemas
-ON database_name = catalog_name
-WHERE database_name ILIKE :CATALOG ESCAPE '!'
-GROUP BY database_name;
+FROM db_schemas;

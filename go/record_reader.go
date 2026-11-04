@@ -42,6 +42,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/compute"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/extensions"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -430,141 +431,17 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		case "TIMESTAMP_NTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
-			scaleDivisor := int64(math.Pow10(int(srcMeta.Scale)))
-			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				pool := compute.GetAllocator(ctx)
-				tb := array.NewTimestampBuilder(pool, dt)
-				defer tb.Release()
-
-				if a.DataType().ID() != arrow.STRUCT {
-					values := a.(*array.Int64).Int64Values()
-					for i, value := range values {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						t := scaledTimestampToTime(value, scaleDivisor, fractionMultiplier)
-						v, err := getArrowTimestampFromTime(t, dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-					return tb.NewArray(), nil
-				}
-
-				structData := a.(*array.Struct)
-				epoch := structData.Field(0).(*array.Int64).Int64Values()
-				fraction := structData.Field(1).(*array.Int32).Int32Values()
-				for i := range a.Len() {
-					if a.IsNull(i) {
-						tb.AppendNull()
-						continue
-					}
-
-					v, err := getArrowTimestampFromTime(time.Unix(epoch[i], int64(fraction[i])), dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-					if err != nil {
-						return nil, err
-					}
-					tb.Append(v)
-				}
-				return tb.NewArray(), nil
-			}
+			transformers[i] = timestampTransformer(false, dt, srcMeta.Scale, originalArrowUnit, maxTimestampPrecision, nil)
 		case "TIMESTAMP_LTZ":
 			dt := &arrow.TimestampType{Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision), TimeZone: loc.String()}
 			f.Type = dt
-			scaleDivisor := int64(math.Pow10(int(srcMeta.Scale)))
-			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				pool := compute.GetAllocator(ctx)
-				tb := array.NewTimestampBuilder(pool, dt)
-				defer tb.Release()
-
-				if a.DataType().ID() == arrow.STRUCT {
-					structData := a.(*array.Struct)
-					epoch := structData.Field(0).(*array.Int64).Int64Values()
-					fraction := structData.Field(1).(*array.Int32).Int32Values()
-					for i := range a.Len() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						v, err := getArrowTimestampFromTime(time.Unix(epoch[i], int64(fraction[i])), dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				} else {
-					for i, value := range a.(*array.Int64).Int64Values() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						t := scaledTimestampToTime(value, scaleDivisor, fractionMultiplier).In(loc)
-						v, err := getArrowTimestampFromTime(t, dt.TimeUnit(), originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				}
-				return tb.NewArray(), nil
-			}
+			transformers[i] = timestampTransformer(false, dt, srcMeta.Scale, originalArrowUnit, maxTimestampPrecision, loc)
 		case "TIMESTAMP_TZ":
 			// we convert each value to UTC since we have timezone information
 			// with the data that lets us do so.
 			dt := &arrow.TimestampType{TimeZone: "UTC", Unit: getArrowTimeUnit(srcMeta.Scale, maxTimestampPrecision)}
 			f.Type = dt
-			scaleDivisor := int64(math.Pow10(int(srcMeta.Scale)))
-			fractionMultiplier := int64(math.Pow10(9 - int(srcMeta.Scale)))
-			transformers[i] = func(ctx context.Context, a arrow.Array) (arrow.Array, error) {
-				pool := compute.GetAllocator(ctx)
-				tb := array.NewTimestampBuilder(pool, dt)
-				defer tb.Release()
-
-				structData := a.(*array.Struct)
-				if structData.NumField() == 2 {
-					epoch := structData.Field(0).(*array.Int64).Int64Values()
-					tzoffset := structData.Field(1).(*array.Int32).Int32Values()
-					for i := range a.Len() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						loc := gosnowflake.Location(int(tzoffset[i]) - 1440)
-						t := scaledTimestampToTime(epoch[i], scaleDivisor, fractionMultiplier).In(loc)
-						v, err := getArrowTimestampFromTime(t, dt.Unit, originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				} else {
-					epoch := structData.Field(0).(*array.Int64).Int64Values()
-					fraction := structData.Field(1).(*array.Int32).Int32Values()
-					tzoffset := structData.Field(2).(*array.Int32).Int32Values()
-					for i := range a.Len() {
-						if a.IsNull(i) {
-							tb.AppendNull()
-							continue
-						}
-
-						loc := gosnowflake.Location(int(tzoffset[i]) - 1440)
-						v, err := getArrowTimestampFromTime(time.Unix(epoch[i], int64(fraction[i])).In(loc), dt.Unit, originalArrowUnit, maxTimestampPrecision)
-						if err != nil {
-							return nil, err
-						}
-						tb.Append(v)
-					}
-				}
-				return tb.NewArray(), nil
-			}
+			transformers[i] = timestampTransformer(true, dt, srcMeta.Scale, originalArrowUnit, maxTimestampPrecision, nil)
 		default:
 			transformers[i] = identCol
 		}
@@ -747,17 +624,18 @@ func rowTypesToArrowSchema(_ context.Context, ld gosnowflake.ArrowStreamLoader, 
 }
 
 func extractTimestamp(src *string) (sec, nsec int64, err error) {
-	s, ms, hasFraction := strings.Cut(*src, ".")
+	s, frac, _ := strings.Cut(*src, ".")
 	sec, err = strconv.ParseInt(s, 10, 64)
-	if err != nil {
+	if err != nil || frac == "" {
 		return
 	}
-
-	if !hasFraction {
-		return
+	if len(frac) > 9 {
+		return 0, 0, fmt.Errorf("invalid timestamp %q: more than 9 fractional digits", *src)
 	}
-
-	nsec, err = strconv.ParseInt(ms+strings.Repeat("0", 9-len(ms)), 10, 64)
+	nsec, err = strconv.ParseInt(frac, 10, 64)
+	for range 9 - len(frac) {
+		nsec *= 10
+	}
 	return
 }
 
@@ -792,8 +670,8 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 
 				if snowflakeType == "timestamp_tz" {
 					// "timestamp_tz" should be value + offset separated by space
-					tm := strings.Split(*col, " ")
-					if len(tm) != 2 {
+					value, offsetStr, ok := strings.Cut(*col, " ")
+					if !ok || strings.Contains(offsetStr, " ") {
 						return nil, adbc.Error{
 							Msg:        "invalid TIMESTAMP_TZ data. value doesn't consist of two numeric values separated by a space: " + *col,
 							SqlState:   [5]byte{'2', '2', '0', '0', '7'},
@@ -802,14 +680,14 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 						}
 					}
 
-					sec, nsec, err := extractTimestamp(&tm[0])
+					sec, nsec, err := extractTimestamp(&value)
 					if err != nil {
 						return nil, err
 					}
-					offset, err := strconv.ParseInt(tm[1], 10, 64)
+					offset, err := strconv.ParseInt(offsetStr, 10, 64)
 					if err != nil {
 						return nil, adbc.Error{
-							Msg:        "invalid TIMESTAMP_TZ data. offset value is not an integer: " + tm[1],
+							Msg:        "invalid TIMESTAMP_TZ data. offset value is not an integer: " + offsetStr,
 							SqlState:   [5]byte{'2', '2', '0', '0', '7'},
 							VendorCode: 268000,
 							Code:       adbc.StatusInvalidData,
@@ -849,6 +727,13 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 					}
 				}
 				fb.Append(b)
+			case *array.Decimal128Builder:
+				dt := fb.Type().(*arrow.Decimal128Type)
+				if n, ok := decimal128FromPlainString(*col, dt.Precision, dt.Scale); ok {
+					fb.Append(n)
+				} else if err := fb.AppendValueFromString(*col); err != nil {
+					return nil, err
+				}
 			default:
 				if err := fb.AppendValueFromString(*col); err != nil {
 					return nil, err
@@ -857,6 +742,49 @@ func jsonDataToArrow(_ context.Context, bldr *array.RecordBuilder, rawData [][]*
 		}
 	}
 	return bldr.NewRecordBatch(), nil
+}
+
+// decimal128FromPlainString parses s as [-]digits[.digits] with at most 18
+// significant digits and at most scale fractional digits, which covers most
+// NUMBER values in JSON results. It reports false for anything else, which
+// decimal128.FromString then handles; that goes through math/big and costs
+// about 40 times as much.
+func decimal128FromPlainString(s string, prec, scale int32) (decimal128.Num, bool) {
+	i, neg := 0, false
+	if len(s) > 0 && s[0] == '-' {
+		neg, i = true, 1
+	}
+	var v int64
+	digits, frac, sawDigit, sawDot := 0, int32(0), false, false
+	for ; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			if digits == 18 {
+				return decimal128.Num{}, false
+			}
+			if v != 0 || c != '0' {
+				digits++
+			}
+			v = v*10 + int64(c-'0')
+			sawDigit = true
+			if sawDot {
+				frac++
+			}
+		case c == '.' && !sawDot:
+			sawDot = true
+		default:
+			return decimal128.Num{}, false
+		}
+	}
+	// The result has digits+scale-frac significant digits; checking that
+	// before scaling keeps the 128-bit multiplication from overflowing.
+	if !sawDigit || frac > scale || digits+int(scale-frac) > int(prec) {
+		return decimal128.Num{}, false
+	}
+	if neg {
+		v = -v
+	}
+	return decimal128.FromI64(v).Mul(decimal128.GetScaleMultiplier(int(scale - frac))), true
 }
 
 type reader struct {
@@ -1171,6 +1099,77 @@ func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals []string) err
 	return err
 }
 
+// jsonChunk is a downloaded JSON result chunk, or the error downloading it.
+type jsonChunk struct {
+	data     []byte
+	err      error
+	acquired bool
+}
+
+// jsonChunkPrefetcher downloads JSON result chunks ahead of the reader, up to
+// concurrency at a time, and hands them out in order. A download slot is freed
+// only when the reader takes the chunk, so at most concurrency chunks are held
+// in memory ahead of it.
+type jsonChunkPrefetcher struct {
+	cancel  context.CancelFunc
+	slots   *semaphore.Weighted
+	results []chan jsonChunk
+}
+
+func prefetchJSONChunks(ctx context.Context, batches []gosnowflake.ArrowStreamBatch, concurrency int) *jsonChunkPrefetcher {
+	ctx, cancel := context.WithCancel(ctx)
+	p := &jsonChunkPrefetcher{
+		cancel:  cancel,
+		slots:   semaphore.NewWeighted(int64(max(concurrency, 1))),
+		results: make([]chan jsonChunk, len(batches)),
+	}
+	for i := range p.results {
+		p.results[i] = make(chan jsonChunk, 1)
+	}
+	go func() {
+		for i, b := range batches {
+			if err := p.slots.Acquire(ctx, 1); err != nil {
+				for _, ch := range p.results[i:] {
+					ch <- jsonChunk{err: err}
+				}
+				return
+			}
+			go func() {
+				data, err := readJSONChunk(ctx, b)
+				p.results[i] <- jsonChunk{data: data, err: err, acquired: true}
+			}()
+		}
+	}()
+	return p
+}
+
+// next waits for chunk i. Chunks must be taken in order.
+func (p *jsonChunkPrefetcher) next(i int) ([]byte, error) {
+	c := <-p.results[i]
+	if c.acquired {
+		p.slots.Release(1)
+	}
+	return c.data, c.err
+}
+
+// close stops downloads that haven't finished.
+func (p *jsonChunkPrefetcher) close() { p.cancel() }
+
+func readJSONChunk(ctx context.Context, b gosnowflake.ArrowStreamBatch) ([]byte, error) {
+	rdr, err := b.GetStream(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetStream failed: %w", err)
+	}
+	data, err := io.ReadAll(rdr)
+	if closeErr := rdr.Close(); err == nil && closeErr != nil {
+		return nil, closeErr
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ReadAll failed: %w", err)
+	}
+	return data, nil
+}
+
 // readJSONBatches handles the case where GetBatches() returned downloadable
 // chunks that contain JSON data instead of Arrow IPC. This happens with some
 // Snowflake stored procedures that return JSON-format results even when Arrow
@@ -1179,7 +1178,7 @@ func decodeJSONChunkRow(dec *jsontext.Decoder, row []*string, vals []string) err
 //
 // batch0Data contains the already-read bytes for batches[0] (since its stream
 // was consumed during format detection). Remaining batches are read via GetStream.
-func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool, queryID *string) (array.RecordReader, error) {
+func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, batches []gosnowflake.ArrowStreamBatch, batch0Data []byte, prefetchConcurrency int, maxTimestampPrecision MaxTimestampPrecision, useHighPrecision bool, queryID *string) (array.RecordReader, error) {
 	trace.SpanFromContext(ctx).AddEvent("readJSONBatches", trace.WithAttributes(
 		attribute.Int("batches", len(batches)),
 	))
@@ -1200,32 +1199,21 @@ func readJSONBatches(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 	bldr := array.NewRecordBuilder(alloc, schema)
 	defer bldr.Release()
 
+	chunks := prefetchJSONChunks(ctx, batches[1:], prefetchConcurrency)
+	defer chunks.close()
+
 	var results []arrow.RecordBatch
 	var rawData [][]*string
 	var totalRowsRead int64
 	for batchIdx, b := range batches {
-		var data []byte
-		if batchIdx == 0 {
-			// Use the already-read data for batch[0]
-			data = batch0Data
-		} else {
-			rdr, err := b.GetStream(ctx)
-			if err != nil {
+		data := batch0Data
+		if batchIdx > 0 {
+			var err error
+			if data, err = chunks.next(batchIdx - 1); err != nil {
 				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d]: GetStream failed: %s", batchIdx, err.Error()),
+					Msg:  fmt.Sprintf("batch[%d]: %s", batchIdx, err.Error()),
 					Code: adbc.StatusInternal,
 				}
-			}
-
-			data, err = io.ReadAll(rdr)
-			rdrErr := rdr.Close()
-			if err != nil {
-				return nil, adbc.Error{
-					Msg:  fmt.Sprintf("batch[%d]: ReadAll failed: %s", batchIdx, err.Error()),
-					Code: adbc.StatusInternal,
-				}
-			} else if rdrErr != nil {
-				return nil, rdrErr
 			}
 		}
 
@@ -1300,30 +1288,22 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 		defer rec.Release()
 
+		chunks := prefetchJSONChunks(ctx, batches, prefetchConcurrency)
+		defer chunks.close()
+
 		results := []arrow.RecordBatch{rec}
 		totalRowsRead := rec.NumRows()
-		for _, b := range batches {
-			rdr, err := b.GetStream(ctx)
-			if err != nil {
-				return nil, adbc.Error{
-					Msg:  err.Error(),
-					Code: adbc.StatusInternal,
-				}
-			}
-
+		for i, b := range batches {
 			// the "JSON" data returned isn't valid JSON. Instead it is a list of
 			// comma-delimited JSON lists containing every value as a string, except
 			// for a JSON null to represent nulls. Thus we can't just use the existing
 			// JSON parsing code in Arrow.
-			data, err := io.ReadAll(rdr)
-			rdrErr := rdr.Close()
+			data, err := chunks.next(i)
 			if err != nil {
 				return nil, adbc.Error{
 					Msg:  err.Error(),
 					Code: adbc.StatusInternal,
 				}
-			} else if rdrErr != nil {
-				return nil, rdrErr
 			}
 
 			if cap(rawData) >= int(b.NumRows()) {
@@ -1405,7 +1385,7 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		trace.SpanFromContext(ctx).AddEvent("newRecordReader.jsonFormat", trace.WithAttributes(
 			attribute.Int("batch0Bytes", len(raw0Data)),
 		))
-		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, maxTimestampPrecision, useHighPrecision, queryID)
+		return readJSONBatches(ctx, alloc, ld, batches, raw0Data, prefetchConcurrency, maxTimestampPrecision, useHighPrecision, queryID)
 	}
 
 	r := &countingReadCloser{inner: raw0}

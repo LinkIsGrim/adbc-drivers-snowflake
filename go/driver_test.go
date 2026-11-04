@@ -1914,6 +1914,42 @@ func (suite *SnowflakeTests) TestUntypedNullLiteral() {
 		"SELECT NULL: expected utf8, got %s", rdr.Schema().Field(0).Type)
 }
 
+// A JSON result large enough to arrive in several chunks comes back complete
+// and in order.
+func (suite *SnowflakeTests) TestQueryJSONMultipleChunks() {
+	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, suite.Quirks.DatabaseOptions())
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
+	cnxn, err := db.Open(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), cnxn, suite.ctx)
+
+	stmt, err := cnxn.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), stmt, suite.ctx)
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, "ALTER SESSION SET GO_QUERY_RESULT_FORMAT = 'JSON'"))
+	_, err = stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	const numRows = 300_000
+	suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, fmt.Sprintf(
+		"SELECT seq4() AS i, randstr(40, random(42)) AS s FROM TABLE(GENERATOR(ROWCOUNT => %d)) ORDER BY i", numRows)))
+	rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	var next int64
+	for rdr.Next() {
+		col := rdr.RecordBatch().Column(0)
+		for i := range col.Len() {
+			suite.Require().Equal(fmt.Sprint(next), col.ValueStr(i), "row %d", next)
+			next++
+		}
+	}
+	suite.Require().NoError(rdr.Err())
+	suite.EqualValues(numRows, next)
+}
+
 func (suite *SnowflakeTests) TestTimestampPrecisionJson() {
 	opts := suite.Quirks.DatabaseOptions()
 	opts[driver.OptionMaxTimestampPrecision] = driver.OptionValueMicroseconds
@@ -2060,6 +2096,112 @@ func (suite *SnowflakeTests) TestTimezonePrecision() {
 	}
 
 	suite.queryTimestamps(query_ns, expectedMicrosecondsResults_ns, expectedNanosecondResults_ns, false)
+}
+
+// Each TIMESTAMP type at every scale, before and after the epoch, in each
+// timestamp precision mode. Snowflake sends these as int64 or as structs of
+// epoch, fraction and timezone depending on the type and scale.
+func (suite *SnowflakeTests) TestTimestampScales() {
+	zone := time.FixedZone("+0530", 5*3600+30*60)
+	instants := []time.Time{
+		time.Date(2025, 6, 2, 10, 37, 56, 123456789, zone),
+		time.Date(1969, 12, 31, 23, 59, 59, 987654321, zone),
+	}
+	const scales = 10
+	truncate := func(t time.Time, scale int) time.Time {
+		return t.Truncate(time.Duration(math.Pow10(9 - scale)))
+	}
+	literal := func(typ string, t time.Time, scale int) string {
+		lit := truncate(t, scale).Format("2006-01-02 15:04:05.000000000")
+		lit = strings.TrimSuffix(lit[:len(lit)-(9-scale)], ".")
+		if typ != "TIMESTAMP_NTZ" {
+			lit += t.Format(" -0700")
+		}
+		return "'" + lit + "'"
+	}
+
+	for _, mode := range []string{driver.OptionValueNanoseconds, driver.OptionValueNanosecondsNoOverflow, driver.OptionValueMicroseconds} {
+		opts := suite.Quirks.DatabaseOptions()
+		opts[driver.OptionMaxTimestampPrecision] = mode
+		db, err := suite.driver.NewDatabaseWithContext(suite.ctx, opts)
+		suite.Require().NoError(err)
+		cnxn, err := db.Open(suite.ctx)
+		suite.Require().NoError(err)
+		stmt, err := cnxn.NewStatement(suite.ctx)
+		suite.Require().NoError(err)
+
+		for _, typ := range []string{"TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ"} {
+			var cols []string
+			for scale := range scales {
+				cols = append(cols, fmt.Sprintf("column%d::%s(%d) AS s%d", scale+1, typ, scale, scale))
+			}
+			var rows []string
+			for i, t := range instants {
+				var vals []string
+				for scale := range scales {
+					vals = append(vals, literal(typ, t, scale))
+				}
+				rows = append(rows, fmt.Sprintf("(%s, %d)", strings.Join(vals, ", "), i))
+			}
+			rows = append(rows, fmt.Sprintf("(%s%d)", strings.Repeat("NULL, ", scales), len(instants)))
+			query := fmt.Sprintf("SELECT %s FROM VALUES %s ORDER BY column%d", strings.Join(cols, ", "), strings.Join(rows, ", "), scales+1)
+
+			suite.Run(typ+"/"+mode, func() {
+				suite.Require().NoError(stmt.SetSqlQuery(suite.ctx, query))
+				rdr, _, err := stmt.ExecuteQuery(suite.ctx)
+				suite.Require().NoError(err)
+				defer rdr.Release()
+				var got [scales][]*arrow.Timestamp
+				var units [scales]arrow.TimeUnit
+				for rdr.Next() {
+					rec := rdr.RecordBatch()
+					for scale := range scales {
+						col := rec.Column(scale).(*array.Timestamp)
+						units[scale] = col.DataType().(*arrow.TimestampType).Unit
+						for i := range col.Len() {
+							if col.IsNull(i) {
+								got[scale] = append(got[scale], nil)
+							} else {
+								v := col.Value(i)
+								got[scale] = append(got[scale], &v)
+							}
+						}
+					}
+				}
+				suite.Require().NoError(rdr.Err())
+
+				for scale := range scales {
+					unit := arrow.Nanosecond
+					switch {
+					case scale == 0:
+						unit = arrow.Second
+					case scale <= 3:
+						unit = arrow.Millisecond
+					case scale <= 6 || mode == driver.OptionValueMicroseconds:
+						unit = arrow.Microsecond
+					}
+					suite.Equal(unit, units[scale], "scale %d", scale)
+					suite.Require().Len(got[scale], len(instants)+1, "scale %d", scale)
+					for i, t := range instants {
+						if typ == "TIMESTAMP_NTZ" {
+							// The wall-clock time, read as UTC.
+							t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+						}
+						want, err := arrow.TimestampFromTime(truncate(t, scale), unit)
+						suite.Require().NoError(err)
+						if suite.NotNil(got[scale][i], "scale %d row %d", scale, i) {
+							suite.Equal(want, *got[scale][i], "scale %d row %d", scale, i)
+						}
+					}
+					suite.Nil(got[scale][len(instants)], "scale %d null row", scale)
+				}
+			})
+		}
+
+		suite.Require().NoError(stmt.Close(suite.ctx))
+		suite.Require().NoError(cnxn.Close(suite.ctx))
+		suite.Require().NoError(db.Close(suite.ctx))
+	}
 }
 
 func (suite *SnowflakeTests) queryTimestamps(query string, expectedMicrosecondResults []arrow.Timestamp, expectedNanosecondResults []arrow.Timestamp, testOverflow ...bool) {
@@ -2690,6 +2832,78 @@ func (suite *SnowflakeTests) TestIngestManySmallFiles() {
 
 	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
 	suite.Require().NoError(err)
+	suite.EqualValues(numBatches*batchSize, n)
+}
+
+// Rows another session writes to the target table during ingestion are not
+// counted as rows affected.
+func (suite *SnowflakeTests) TestIngestRowsAffectedWithConcurrentWriter() {
+	const table = "bulk_ingest_concurrent_writer"
+	suite.Require().NoError(suite.Quirks.DropTable(suite.cnxn, table))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TABLE "+quoteIdentifier(table)+" (col_int64 BIGINT, col_string VARCHAR)"))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	sc := arrow.NewSchema([]arrow.Field{
+		{Name: "col_int64", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "col_string", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	bldr := array.NewRecordBuilder(suite.Quirks.Alloc(), sc)
+	defer bldr.Release()
+
+	const numBatches, batchSize = 300, 200
+	recs := make([]arrow.RecordBatch, numBatches)
+	for b := range numBatches {
+		for i := range batchSize {
+			bldr.Field(0).(*array.Int64Builder).Append(int64(b*batchSize + i))
+			bldr.Field(1).(*array.StringBuilder).Append("ingested")
+		}
+		recs[b] = bldr.NewRecordBatch()
+		defer recs[b].Release()
+	}
+	rdr, err := array.NewRecordReader(sc, recs)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	writer, err := suite.db.Open(suite.ctx)
+	suite.Require().NoError(err)
+	defer func() { suite.NoError(writer.Close(suite.ctx)) }()
+	writerStmt, err := writer.NewStatement(suite.ctx)
+	suite.Require().NoError(err)
+	defer func() { suite.NoError(writerStmt.Close(suite.ctx)) }()
+	suite.Require().NoError(writerStmt.SetSqlQuery(suite.ctx, "INSERT INTO "+quoteIdentifier(table)+" SELECT -1, 'other' FROM TABLE(GENERATOR(ROWCOUNT => 100))"))
+
+	// Keep inserting from the other session until ingestion returns.
+	ingestDone := make(chan struct{})
+	writerDone := make(chan error, 1)
+	var insertedDuringIngest int64
+	go func() {
+		for {
+			n, err := writerStmt.ExecuteUpdate(suite.ctx)
+			if err != nil {
+				writerDone <- err
+				return
+			}
+			select {
+			case <-ingestDone:
+				writerDone <- nil
+				return
+			default:
+				insertedDuringIngest += n
+			}
+		}
+	}()
+
+	suite.Require().NoError(suite.stmt.BindStream(suite.ctx, rdr))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, table))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestMode, adbc.OptionValueIngestModeAppend))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionStatementIngestTargetFileSize, "1024"))
+	n, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	close(ingestDone)
+	suite.Require().NoError(<-writerDone)
+	suite.Require().NoError(err)
+
+	suite.Require().Positive(insertedDuringIngest, "the other session inserted no rows during ingestion")
 	suite.EqualValues(numBatches*batchSize, n)
 }
 
@@ -3600,6 +3814,69 @@ func (suite *SnowflakeTests) TestGetStatisticNames() {
 	suite.True(rdr.Next())
 	rec := rdr.RecordBatch()
 	suite.Equal(int64(6), rec.NumRows())
+}
+
+// GetStatistics across every database returns the same statistics for each
+// table as a call narrowed to that table's schema.
+func (suite *SnowflakeTests) TestGetStatisticsAcrossDatabases() {
+	schemas := []string{"ADBC_STATS_S0", "ADBC_STATS_S1", "ADBC_STATS_S2"}
+	tables := []string{"PLAIN", "CLUSTERED"}
+	for _, schema := range schemas {
+		for _, q := range []string{
+			"CREATE SCHEMA IF NOT EXISTS " + schema,
+			"CREATE TABLE IF NOT EXISTS " + schema + ".PLAIN (id INTEGER, name VARCHAR)",
+			"CREATE TABLE IF NOT EXISTS " + schema + ".CLUSTERED (id INTEGER, name VARCHAR) CLUSTER BY (id)",
+		} {
+			suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, q))
+			_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+			suite.Require().NoError(err, q)
+		}
+	}
+
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT CURRENT_DATABASE()"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	suite.Require().True(rdr.Next())
+	currentDb := rdr.RecordBatch().Column(0).(*array.String).Value(0)
+	rdr.Release()
+
+	gs := suite.cnxn.(adbc.ConnectionGetStatistics)
+	getStats := func(catalog *string, schema string, approximate bool) map[string][]testutil.Statistic {
+		rdr, err := gs.GetStatistics(suite.ctx, catalog, &schema, nil, approximate)
+		suite.Require().NoError(err)
+		defer rdr.Release()
+		stats := map[string][]testutil.Statistic{}
+		for rdr.Next() {
+			for _, s := range schemas {
+				for _, t := range tables {
+					stats[s+"."+t] = append(stats[s+"."+t], testutil.ExtractStatisticsForTable(rdr.RecordBatch(), currentDb, s, t)...)
+				}
+			}
+		}
+		suite.Require().NoError(rdr.Err())
+		return stats
+	}
+
+	for _, approximate := range []bool{true, false} {
+		suite.Run(fmt.Sprintf("approximate=%v", approximate), func() {
+			all := getStats(nil, "ADBC_STATS_S_", approximate)
+			for _, s := range schemas {
+				narrow := getStats(&currentDb, s, approximate)
+				for _, t := range tables {
+					name := s + "." + t
+					byKey := testutil.StatisticsToLookupMap(all[name])
+					for _, key := range []int16{adbc.StatisticRowCountKey, driver.SnowflakeStatisticBytesKey, driver.SnowflakeStatisticRetentionTimeDaysKey} {
+						suite.Contains(byKey, key, "%s: statistic %d", name, key)
+					}
+					if !approximate {
+						_, hasDepth := byKey[driver.SnowflakeStatisticClusteringDepthKey]
+						suite.Equal(t == "CLUSTERED", hasDepth, "%s: clustering depth", name)
+					}
+					suite.ElementsMatch(narrow[name], all[name], name)
+				}
+			}
+		})
+	}
 }
 
 func (suite *SnowflakeTests) TestGetStatisticsBasic() {
